@@ -1,11 +1,15 @@
 import json
 import sys
+from datetime import date, timedelta
+
+from pathlib import Path
 
 import config
 from modules.excel import leer_excel, filtrar_por_sede, guardar_pacientes
 from modules.logger import setup_logger
 from modules.mirspiro_module import MirSpiroAutomation
 from modules.nube import init_browser, login, descargar_reporte
+from modules.subir_sunu import procesar_carga_pdfs
 
 
 def modulo_1(logger) -> list[dict]:
@@ -77,8 +81,8 @@ def modulo_2(logger, pacientes: list[dict]) -> dict:
     resultados = {"ok": 0, "fallos": 0, "detalles": []}
 
     for i, pac in enumerate(pacientes, 1):
-        cedula = str(pac.get("IDENTIFICACION_DEL_PACIENTE", ""))
-        nombre = pac.get("NOMBRE_DEL_PACIENTE", "")
+        cedula = str(pac.get("cedula", ""))
+        nombre = pac.get("nombre", pac.get("NOMBRE_DEL_PACIENTE", ""))
 
         logger.info("[%d/%d] %s - %s", i, len(pacientes), cedula, nombre)
 
@@ -101,17 +105,56 @@ def modulo_2(logger, pacientes: list[dict]) -> dict:
     return resultados
 
 
+def modulo_3(logger, fecha_objetivo: date) -> dict:
+    """Sube los PDFs generados a los perfiles de los pacientes en Sunu."""
+    logger.info("=== MÓDULO 3: Carga de PDFs a Sunu ===")
+
+    try:
+        driver = init_browser()
+        from modules.nube import login as nube_login
+        nube_login(driver)
+        from selenium.webdriver.support.ui import WebDriverWait
+        wait = WebDriverWait(driver, 15)
+
+        res = procesar_carga_pdfs(
+            driver=driver,
+            wait=wait,
+            carpeta_pdfs=config.PDF_DIR,
+            fecha_objetivo=fecha_objetivo,
+        )
+        driver.quit()
+        return res
+    except Exception as e:
+        logger.error("Error en Módulo 3: %s", e)
+        return {"exitosos": [], "pendientes": []}
+
+
 def main():
     logger = setup_logger()
 
+    fecha_objetivo = date.today() - timedelta(days=1)
+    logger.info("Fecha objetivo: %s", fecha_objetivo)
+
     pacientes = modulo_1(logger)
-    resultados = modulo_2(logger, pacientes)
+    resultados_mirspiro = modulo_2(logger, pacientes)
 
-    resumen_path = config.DATA_DIR / "resultados_mirspiro.json"
+    resumen_path = Path(config.DATA_DIR) / "resultados_mirspiro.json"
     with open(resumen_path, "w", encoding="utf-8") as f:
-        json.dump(resultados, f, indent=2, ensure_ascii=False)
+        json.dump(resultados_mirspiro, f, indent=2, ensure_ascii=False)
+    logger.info("Resumen MirSpiro guardado en %s", resumen_path)
 
-    logger.info("Resumen guardado en %s", resumen_path)
+    resultados_sunu = modulo_3(logger, fecha_objetivo)
+
+    resumen_final_path = Path(config.DATA_DIR) / "resultados_final.json"
+    with open(resumen_final_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "mirspiro": resultados_mirspiro,
+            "sunu": resultados_sunu,
+            "fecha_objetivo": fecha_objetivo.isoformat(),
+            "sede": config.SEDE_LOCAL,
+        }, f, indent=2, ensure_ascii=False)
+    logger.info("Resumen final guardado en %s", resumen_final_path)
+
     logger.info("=== FIN ===")
 
 

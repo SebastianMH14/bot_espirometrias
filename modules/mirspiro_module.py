@@ -1,23 +1,23 @@
 """
 MirSpiro Automation Module
 ==========================
-Automatización RPA de escritorio para la aplicación MirSpiro.
+Automatización RPA de escritorio para MirSpiro.
 
 ESTRATEGIA:
-  - pywinauto con backend UIA
+  - uiautomation (UI Automation via COM, sin dependencia de pywin32)
+  - Funciona en Python 3.12+ / 3.14+
   - Selectores configurables vía dict DEFAULT_SELECTORS
-  - Resuelve controles por placeholder / automation_id / texto
-  - Esperas inteligentes (wait visible/enabled), retry con backoff
+  - Esperas por existencia/habilitación, retry con backoff
   - Logging detallado por paso
 
-FLUJO REAL (validado con operador):
+FLUJO REAL:
   1. Abrir MirSpiro
-  2. Escribir cédula en input "Buscar pacientes" → Enter
-  3. Click botón "Imprimir" → se abre modal tipo Print Preview
-  4. Click "Guardar PDF" → se abre diálogo Guardar como de Windows
-  5. Escribir nombre y Guardar
-  6. Click "Cancelar" para cerrar el modal
-  7. Repetir con siguiente paciente (misma ventana abierta)
+  2. Escribir cédula en input "Buscar pacientes" + Enter
+  3. Click "Imprimir" → modal Print Preview
+  4. Click "Guardar PDF" → diálogo Guardar como
+  5. Guardar como {cedula}_{YYYYMMDD}_{HHMMSS}.pdf
+  6. Click "Cancelar" para cerrar modal
+  7. Siguiente paciente (misma ventana abierta)
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from pywinauto import Application, WindowSpecification
+import uiautomation as uia
 
 log = logging.getLogger("bot_espirometrias.mirspiro")
 
@@ -36,31 +36,24 @@ log = logging.getLogger("bot_espirometrias.mirspiro")
 # Selectores UI por defecto
 # ──────────────────────────────────────────────
 DEFAULT_SELECTORS: dict[str, Any] = {
-    "main_window_title": "MIR Spiro",
-    "search_field_placeholder": "Buscar pacientes",
-    "search_field_auto_id": None,
-    "print_button_text": "Imprimir",
-    "print_button_auto_id": None,
-    "modal_title": "",                        # Se auto-detecta si está vacío
+    "main_window_title": "Mir Spiro",
+    "startup_button_text": "Continuar",
+    "startup_disabled_timeout": 12,
+    "search_field_auto_id": "ptbSearch",
+    "print_button_auto_id": "printButton",
     "guardar_pdf_button_text": "Guardar PDF",
-    "guardar_pdf_button_auto_id": None,
     "cancel_button_text": "Cancelar",
-    "cancel_button_auto_id": None,
     "save_dialog_title": "Guardar como",
     "save_button_text": "Guardar",
-    "overwrite_confirm_title_re": "Confirmar.*sobrescritura|Confirmación",
-    "overwrite_yes_text": "Sí",
+    "overwrite_confirm_title_re": "Confirmar sobreescritura|Confirmación",
 }
 
 
 def _build_pdf_filename(cedula: str) -> str:
-    now = datetime.now()
-    return f"{cedula}_{now.strftime('%Y%m%d_%H%M%S')}.pdf"
+    return f"{cedula}.pdf"
 
 
 class MirSpiroAutomation:
-    """Controla MirSpiro vía UI Automation (RPA de escritorio)."""
-
     def __init__(
         self,
         sede: str,
@@ -76,8 +69,7 @@ class MirSpiroAutomation:
         self.selectors = {**DEFAULT_SELECTORS, **(selectors or {})}
         self.typing_delay = typing_delay
         self.retry_attempts = retry_attempts
-        self.app: Application | None = None
-        self.main_window: WindowSpecification | None = None
+        self.main_window: uia.WindowControl | None = None
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -95,88 +87,170 @@ class MirSpiroAutomation:
                     time.sleep(attempt * 1.0)
         raise last_err  # type: ignore[misc]
 
+    def _find_control(
+        self,
+        parent: uia.Control,
+        condition: dict,
+        timeout: float = 5,
+    ) -> uia.Control:
+        """Busca un control hijo recursivamente por criterios con timeout."""
+        control_type = condition.get("control_type", "")
+        name = condition.get("name")
+        auto_id = condition.get("auto_id")
+        class_name = condition.get("class_name")
+
+        def _match(c: uia.Control) -> bool:
+            if auto_id and c.AutomationId != auto_id:
+                return False
+            if name and c.Name != name:
+                return False
+            if class_name and c.ClassName != class_name:
+                return False
+            if control_type and c.ControlTypeName != control_type:
+                return False
+            return bool(auto_id or name or class_name or control_type)
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for child in self._collect_children(parent):
+                if _match(child):
+                    return child
+            time.sleep(0.3)
+
+        raise RuntimeError(f"Control no encontrado: {condition}")
+
     # ── 1. Conexión / apertura ────────────────────────────
 
     def conectar(self, timeout: float = 30) -> None:
-        """Inicia MirSpiro o se conecta si ya está en ejecución."""
+        """Inicia MirSpiro, cierra el modal de suscripción y localiza la ventana principal."""
         if self.executable_path:
             log.info("Iniciando MirSpiro desde %s", self.executable_path)
-            self.app = Application(backend="uia").start(self.executable_path, timeout=timeout)
+            import subprocess
+            subprocess.Popen(self.executable_path)
         else:
             log.info("Conectando a MirSpiro ya en ejecución…")
-            self.app = Application(backend="uia").connect(
-                title_re=self.selectors["main_window_title"], timeout=timeout
-            )
 
-        self.main_window = self.app.window(title_re=self.selectors["main_window_title"])
-        self.main_window.wait("visible", timeout=timeout)
-        self.main_window.wait("enabled", timeout=timeout)
-        log.info("Ventana principal: '%s'", self.main_window.window_text())
+        # ── Localizar ventana principal primero ──
+        title_re = self.selectors["main_window_title"]
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            # Buscar ventana cuyo título contenga "Mir Spiro"
+            for w in uia.GetRootControl().GetChildren():
+                if w.ControlTypeName == "WindowControl" and title_re in (w.Name or ""):
+                    self.main_window = w
+                    break
+            if self.main_window:
+                break
+            time.sleep(0.5)
+
+        if not self.main_window:
+            raise RuntimeError(f"No se encontró ventana con título '{title_re}'")
+        log.info("Ventana principal: '%s'", self.main_window.Name)
+
+        # ── Cerrar modal de suscripción ──
+        log.info("Cerrando modal de suscripción…")
+        self._cerrar_startup_modal()
+        log.info("Modal procesado, continuando…")
+
+    @staticmethod
+    def _collect_children(parent, max_depth=10, _depth=0, _results=None):
+        """Recolecta todos los controles hijos recursivamente."""
+        if _results is None:
+            _results = []
+        if _depth >= max_depth:
+            return _results
+        for child in parent.GetChildren():
+            _results.append(child)
+            MirSpiroAutomation._collect_children(child, max_depth, _depth + 1, _results)
+        return _results
+
+    def _cerrar_startup_modal(self) -> None:
+        """Cierra el modal de suscripción con pyautogui (no expone controles UIA)."""
+        import pyautogui
+
+        log.info("Esperando 12s para que 'Continuar' se habilite…")
+        time.sleep(12)
+
+        rect = self.main_window.BoundingRectangle
+        if not rect:
+            log.warning("No se pudieron obtener bounds de la ventana")
+            return
+
+        win_w = rect.right - rect.left
+        win_h = rect.bottom - rect.top
+
+        # "Continuar" está abajo a la derecha del modal
+        # Modal ocupa ~60% del ancho, centrado
+        # Botón a ~65% del ancho de la ventana, ~93% del alto
+        click_x = rect.left + int(win_w * 0.645)
+        click_y = rect.top + int(win_h * 0.88)
+
+        log.info("Click en 'Continuar' en (%d, %d) [ventana %dx%d en (%d,%d)]",
+                 click_x, click_y, win_w, win_h, rect.left, rect.top)
+        pyautogui.click(click_x, click_y)
+        time.sleep(1)
 
     # ── 2. Búsqueda de paciente ───────────────────────────
 
     def buscar_paciente(self, cedula: str) -> None:
         """Escribe la cédula en el campo 'Buscar pacientes' y presiona Enter."""
+        import pyautogui
+
         sel = self.selectors
-        main = self.main_window
         log.info("Buscando paciente %s…", cedula)
 
-        search = self._retry(self._find_search_field, main, sel)
-        search.click_input()
-        search.clear()
+        search = self._retry(self._find_search_field, sel)
 
+        # Click sobre el search field usando pyautogui para asegurar foreground + focus
+        rect = search.BoundingRectangle
+        if rect:
+            click_x = (rect.left + rect.right) // 2
+            click_y = (rect.top + rect.bottom) // 2
+            pyautogui.click(click_x, click_y)
+        else:
+            search.Click()
+
+        time.sleep(0.15)
+
+        # ── Limpiar campo ──────────────────────────────────
+        # Estrategia A: triple click (selecciona todo el texto)
+        if rect:
+            pyautogui.tripleClick(click_x, click_y)
+            time.sleep(0.1)
+            pyautogui.press("delete")
+        else:
+            # Estrategia B: Ctrl+A vía pyautogui
+            pyautogui.hotkey("ctrl", "a")
+            pyautogui.press("delete")
+        time.sleep(0.1)
+
+        # ── Escribir nueva cédula ─────────────────────────
         for ch in cedula:
-            search.type_keys(ch, pause=self.typing_delay)
+            search.SendKeys(ch, waitTime=self.typing_delay)
 
-        search.type_keys("{ENTER}")
+        search.SendKeys("{ENTER}")
         time.sleep(0.3)
         log.info("Búsqueda ejecutada para %s", cedula)
 
-    @staticmethod
-    def _find_search_field(main: WindowSpecification, sel: dict) -> Any:
+    def _find_search_field(self, sel: dict) -> uia.Control:
         aid = sel.get("search_field_auto_id")
-        placeholder = sel.get("search_field_placeholder")
-
         if aid:
-            return main.child_window(auto_id=aid, control_type="Edit").wait("visible", timeout=5)
-
-        if placeholder:
-            for prop in ("help_text", "name"):
-                try:
-                    return main.child_window(**{prop: placeholder}, control_type="Edit").wait(
-                        "visible", timeout=3
-                    )
-                except Exception:
-                    continue
-
-        return main.child_window(class_name="Edit").wait("visible", timeout=5)
+            return self._find_control(self.main_window, {"auto_id": aid})
+        return self._find_control(self.main_window, {"control_type": "EditControl"})
 
     # ── 3. Imprimir → Guardar PDF ─────────────────────────
 
     def exportar_pdf(self, cedula: str) -> str:
-        """
-        Flujo:
-          1. Click "Imprimir"
-          2. En el modal → click "Guardar PDF"
-          3. Se abre Guardar como → escribir ruta y Guardar
-          4. Click "Cancelar" para cerrar el modal
-        """
         sel = self.selectors
         pdf_name = _build_pdf_filename(cedula)
         pdf_path = self.output_dir / pdf_name
         log.info("Exportando PDF: %s", pdf_path)
 
         self._click_imprimir(sel)
-        modal = self._esperar_modal(sel)
-        self._click_guardar_pdf(modal, sel)
-
-        # Guardar como
+        self._esperar_y_click_guardar_pdf()
         self._guardar_como(pdf_path, sel)
+        self._cerrar_modal_impresion()
 
-        # Cerrar modal
-        self._cerrar_modal(modal, sel)
-
-        # Validación
         if not pdf_path.exists():
             raise RuntimeError(f"No se generó el PDF: {pdf_path}")
         if pdf_path.stat().st_size == 0:
@@ -187,130 +261,87 @@ class MirSpiroAutomation:
         return str(pdf_path.resolve())
 
     def _click_imprimir(self, sel: dict) -> None:
-        btn_text = sel["print_button_text"]
         btn_aid = sel.get("print_button_auto_id")
-
-        kwargs: dict[str, Any] = {"control_type": "Button"}
-        if btn_text:
-            kwargs["text"] = btn_text
         if btn_aid:
-            kwargs["auto_id"] = btn_aid
-
-        btn = self.main_window.child_window(**kwargs)
-        btn.wait("visible", timeout=10)
-        btn.click_input()
+            btn = self._retry(self._find_control, self.main_window, {"auto_id": btn_aid})
+        else:
+            btn = self._retry(self._find_control, self.main_window, {"name": "Imprimir"})
+        btn.Click()
         log.info("Click en 'Imprimir'")
+        time.sleep(1)
 
-    def _esperar_modal(self, sel: dict) -> WindowSpecification:
-        """Detecta el modal tipo Print Preview de MirSpiro."""
-        # Intentar con título exacto si está configurado
-        modal_title = sel.get("modal_title")
-        if modal_title:
-            try:
-                modal = self.app.window(title=modal_title)
-                modal.wait("visible", timeout=8)
-                log.info("Modal detectado: '%s'", modal_title)
-                return modal
-            except Exception:
-                pass
+    def _esperar_y_click_guardar_pdf(self) -> None:
+        """Espera el modal de impresión y hace clic en 'Guardar PDF' con pyautogui."""
+        import pyautogui
 
-        # Auto-detección: buscar ventana con botón "Guardar PDF"
-        for w in self.app.windows():
-            try:
-                w.child_window(text=sel["guardar_pdf_button_text"], control_type="Button").wait(
-                    "visible", timeout=1
-                )
-                log.info("Modal auto-detectado: '%s'", w.window_text())
-                return w
-            except Exception:
-                continue
+        log.info("Esperando modal de impresión…")
+        time.sleep(2)
 
-        raise RuntimeError("No se encontró el modal con botón 'Guardar PDF'")
+        rect = self.main_window.BoundingRectangle
+        if not rect:
+            raise RuntimeError("No se pudieron obtener bounds de la ventana")
 
-    def _click_guardar_pdf(self, modal: WindowSpecification, sel: dict) -> None:
-        btn_text = sel["guardar_pdf_button_text"]
-        btn_aid = sel.get("guardar_pdf_button_auto_id")
+        win_w = rect.right - rect.left
+        win_h = rect.bottom - rect.top
 
-        kwargs: dict[str, Any] = {"control_type": "Button"}
-        if btn_text:
-            kwargs["text"] = btn_text
-        if btn_aid:
-            kwargs["auto_id"] = btn_aid
+        # Coordenadas de "Guardar PDF" (medidas: x=1150, y=633 con ventana 1240x768 en 180,42)
+        click_x = rect.left + int(win_w * 0.782)
+        click_y = rect.top + int(win_h * 0.77)
 
-        btn = modal.child_window(**kwargs)
-        btn.wait("visible", timeout=5)
-        btn.click_input()
-        log.info("Click en 'Guardar PDF'")
+        log.info("Click en 'Guardar PDF' en (%d, %d)", click_x, click_y)
+        pyautogui.click(click_x, click_y)
+        time.sleep(1)
 
     def _guardar_como(self, pdf_path: Path, sel: dict) -> None:
-        dlg_title = sel["save_dialog_title"]
-        save_text = sel["save_button_text"]
+        """Escribe la ruta completa en el diálogo Guardar como usando pyautogui."""
+        import pyautogui
 
-        try:
-            dlg = self.app.window(title=dlg_title)
-            dlg.wait("visible", timeout=8)
-        except Exception as e:
-            raise RuntimeError(f"No apareció el diálogo 'Guardar como': {e}")
+        log.info("Esperando diálogo Guardar como…")
+        time.sleep(1)
 
-        # Campo de nombre de archivo
-        try:
-            filename_edit = dlg.child_window(class_name="Edit")
-            filename_edit.wait("visible", timeout=3)
-            filename_edit.clear()
-            filename_edit.type_keys(str(pdf_path.resolve()), pause=0.02)
-        except Exception:
-            pass
-
-        # Botón Guardar
-        try:
-            btn = dlg.child_window(text=save_text, control_type="Button")
-            btn.wait("visible", timeout=3)
-            btn.click_input()
-        except Exception:
-            dlg.type_keys("{ENTER}")
-
+        # Seleccionar todo (Ctrl+A), escribir ruta, Enter
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.2)
+        pyautogui.typewrite(str(pdf_path.resolve()), interval=0.02)
+        time.sleep(0.3)
+        pyautogui.press("enter")
         time.sleep(1)
 
         # Confirmar sobrescritura si aparece
         try:
-            confirm = self.app.window(title_re=sel["overwrite_confirm_title_re"])
-            confirm.wait("visible", timeout=2)
-            confirm.child_window(text=sel["overwrite_yes_text"], control_type="Button").click_input()
+            confirm = uia.WindowControl(
+                searchDepth=1, Name=sel["overwrite_confirm_title_re"]
+            )
+            if confirm.Exists(maxSearchSeconds=2):
+                pyautogui.press("enter")
         except Exception:
             pass
 
-    def _cerrar_modal(self, modal: WindowSpecification, sel: dict) -> None:
-        cancel_text = sel["cancel_button_text"]
-        cancel_aid = sel.get("cancel_button_auto_id")
+    def _cerrar_modal_impresion(self) -> None:
+        """Cierra el modal de impresión (botón Cancelar) con pyautogui."""
+        import pyautogui
 
-        kwargs: dict[str, Any] = {"control_type": "Button"}
-        if cancel_text:
-            kwargs["text"] = cancel_text
-        if cancel_aid:
-            kwargs["auto_id"] = cancel_aid
+        rect = self.main_window.BoundingRectangle
+        if not rect:
+            log.warning("No se pudieron obtener bounds, cerrando con Escape")
+            pyautogui.press("escape")
+            time.sleep(1)
+            return
 
-        try:
-            btn = modal.child_window(**kwargs)
-            btn.wait("visible", timeout=3)
-            btn.click_input()
-            log.info("Modal cerrado con '%s'", cancel_text)
-        except Exception:
-            # Fallback: Escape o cerrar ventana
-            try:
-                modal.type_keys("{ESCAPE}")
-                log.info("Modal cerrado con Escape")
-            except Exception:
-                pass
+        win_w = rect.right - rect.left
+        win_h = rect.bottom - rect.top
 
-        time.sleep(0.3)
+        click_x = rect.left + int(win_w * 0.766)
+        click_y = rect.top + int(win_h * 0.857)
+
+        log.info("Click en 'Cancelar' en (%d, %d)", click_x, click_y)
+        pyautogui.click(click_x, click_y)
+        time.sleep(1)
 
     # ── Flujo completo ────────────────────────────────────
 
     def procesar_paciente(self, cedula: str) -> dict:
-        """
-        Busca paciente, exporta PDF y cierra el modal.
-        NO llama a conectar() — debe llamarse una vez antes de procesar todos.
-        """
+        """Busca paciente, exporta PDF y cierra modal. Requiere conectar() antes."""
         result: dict = {"success": False, "pdf_path": None, "error": None}
         try:
             self.buscar_paciente(cedula)
@@ -323,13 +354,9 @@ class MirSpiroAutomation:
         return result
 
     def cerrar_app(self) -> None:
-        """Cierra la aplicación MirSpiro por completo."""
+        """Cierra MirSpiro."""
         try:
-            self.main_window.close()
+            if self.main_window:
+                self.main_window.GetWindowPattern().Close()
         except Exception:
             pass
-        if self.app:
-            try:
-                self.app.kill()
-            except Exception:
-                pass
