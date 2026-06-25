@@ -215,6 +215,31 @@ class MirSpiroAutomation:
             time.sleep(0.3)
         raise RuntimeError(f"Control con hijo no encontrado: {child_criteria}")
 
+    def _find_control_anywhere(
+        self,
+        condition: dict,
+        timeout: float = 5,
+    ) -> uia.Control:
+        """Busca el control primero en main_window, luego en todas las ventanas top-level."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                return self._find_control(self.main_window, condition, timeout=1)
+            except RuntimeError:
+                pass
+            try:
+                root = uia.GetRootControl()
+                for w in root.GetChildren():
+                    if w.ControlTypeName == "WindowControl":
+                        try:
+                            return self._find_control(w, condition, timeout=1)
+                        except RuntimeError:
+                            continue
+            except Exception:
+                pass
+            time.sleep(0.3)
+        raise RuntimeError(f"Control no encontrado en ningún nivel: {condition}")
+
     @staticmethod
     def _collect_children(parent, max_depth=10, _depth=0, _results=None):
         """Recolecta todos los controles hijos recursivamente."""
@@ -278,43 +303,19 @@ class MirSpiroAutomation:
         log.info("Esperando %ds a que el modal sea interactuable…", wait_time)
         time.sleep(wait_time)
 
-        # Intentar desde main_window (modal es hijo)
+        # Buscar en main_window y root simultáneamente (el modal puede estar en cualquier nivel)
         try:
-            btn = self._retry(
-                self._find_control,
-                self.main_window,
+            btn = self._find_control_anywhere(
                 {"auto_id": sel["continue_button_auto_id"]},
-                timeout=8,
+                timeout=10,
             )
-            log.info("Click en 'Continuar' (BtnContinue) vía main_window")
+            log.info("Click en 'Continuar' (BtnContinue)")
             btn.Click()
             time.sleep(1)
             log.info("Modal de inicio cerrado")
             return
         except RuntimeError:
-            log.info("BtnContinue no encontrado en main_window, buscando en root…")
-
-        # Fallback: buscar en todas las ventanas top-level
-        deadline = time.monotonic() + 8
-        while time.monotonic() < deadline:
-            for w in uia.GetRootControl().GetChildren():
-                if w.ControlTypeName != "WindowControl":
-                    continue
-                if "Mir Spiro" in (w.Name or ""):
-                    continue
-                try:
-                    btn = self._find_control(
-                        w, {"auto_id": sel["continue_button_auto_id"]}, timeout=1
-                    )
-                    if btn:
-                        log.info("Click en 'Continuar' (BtnContinue) vía root")
-                        btn.Click()
-                        time.sleep(1)
-                        log.info("Modal de inicio cerrado")
-                        return
-                except RuntimeError:
-                    continue
-            time.sleep(0.5)
+            log.info("BtnContinue no encontrado por UIA, usando fallback…")
 
         # Último recurso: pyautogui sobre coordenadas relativas
         import pyautogui
@@ -343,9 +344,21 @@ class MirSpiroAutomation:
         sel = self.selectors
         log.info("Buscando paciente %s…", cedula)
 
+        # 1. Traer MirSpiro al frente y enfocar el campo de búsqueda
+        import pyautogui
+        try:
+            self.main_window.SetFocus()
+            time.sleep(0.2)
+        except Exception:
+            pass
         search = self._retry(self._find_search_field, sel)
+        try:
+            search.SetFocus()
+        except Exception:
+            search.Click()
+        time.sleep(0.2)
 
-        # Limpiar campo vía ClearButton (UIA)
+        # 2. Limpiar vía ClearButton (UIA)
         try:
             clear_btn = self._find_control(
                 search,
@@ -358,7 +371,16 @@ class MirSpiroAutomation:
         except RuntimeError:
             log.debug("ClearButton no encontrado, campo posiblemente vacío")
 
-        search.SendKeys(cedula, waitTime=self.typing_delay)
+        # 3. Doble limpieza por teclado (por si ClearButton falla o el foco se perdió)
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.05)
+        pyautogui.press("delete")
+        time.sleep(0.1)
+
+        # 4. Enviar cédula carácter por carácter (MirSpiro necesita pausa entre teclas)
+        for ch in cedula:
+            search.SendKeys(ch, waitTime=self.typing_delay)
+
         search.SendKeys("{ENTER}")
         time.sleep(0.3)
         log.info("Búsqueda ejecutada para %s", cedula)
@@ -431,12 +453,13 @@ class MirSpiroAutomation:
         """
         Maneja el diálogo "Guardar como" de Windows.
 
-        1. Espera a que aparezca el diálogo (WindowControl Name='Guardar como').
-        2. Trae el diálogo al frente antes de escribir.
-        3. Escribe la ruta completa vía pyautogui (el EditControl del nombre
-           de archivo está muy anidado dentro del diálogo nativo de Windows
-           y no es práctico localizarlo por UIA).
-        4. Hace clic en "Guardar" (ButtonControl AutoId='1') vía UIA.
+        1. Elimina PDF existente para evitar diálogo de sobrescritura.
+        2. Espera a que aparezca el diálogo (busca en main_window y root).
+        3. Trae el diálogo al frente antes de escribir.
+        4. Escribe la ruta completa vía pyautogui (el EditControl del nombre
+           de archivo está muy anidado dentro del diálogo nativo de Windows).
+        5. Hace clic en "Guardar" (ButtonControl AutoId='1') vía UIA.
+        6. Si aparece confirmación de sobrescritura, la acepta automáticamente.
         """
         import pyautogui
         import ctypes
@@ -448,9 +471,8 @@ class MirSpiroAutomation:
 
         log.info("Esperando diálogo Guardar como…")
 
-        # Esperar a que el diálogo aparezca (hasta 10s)
-        dlg = self._find_control(
-            self.main_window,
+        # Buscar el diálogo en main_window y root (es una ventana top-level)
+        dlg = self._find_control_anywhere(
             {"name": "Guardar como", "control_type": "WindowControl"},
             timeout=10,
         )
@@ -474,10 +496,9 @@ class MirSpiroAutomation:
         pyautogui.typewrite(str(pdf_path.resolve()), interval=0.02)
         time.sleep(0.3)
 
-        # Click "Guardar" vía UIA (AutoId='1')
+        # Click "Guardar" vía UIA (AutoId='1'), buscar en root como fallback
         try:
-            guardar_btn = self._find_control(
-                self.main_window,
+            guardar_btn = self._find_control_anywhere(
                 {"auto_id": "1", "control_type": "ButtonControl"},
                 timeout=3,
             )
@@ -487,7 +508,23 @@ class MirSpiroAutomation:
             log.warning("Botón Guardar no encontrado por UIA, fallback a Enter")
             pyautogui.press("enter")
 
-        time.sleep(2)
+        time.sleep(1)
+
+        # Si aparece diálogo de confirmación de sobrescritura, aceptarlo
+        try:
+            confirm = self._find_control_anywhere(
+                {"name": "Confirmar guardar como", "control_type": "WindowControl"},
+                timeout=2,
+            )
+            log.info("Diálogo de sobrescritura detectado, aceptando…")
+            si_btn = self._find_control_anywhere(
+                {"auto_id": "6", "control_type": "ButtonControl"},
+                timeout=2,
+            )
+            si_btn.Click()
+            time.sleep(1)
+        except RuntimeError:
+            pass
 
     def _cerrar_modal_impresion(self) -> None:
         """
@@ -665,6 +702,22 @@ class MirSpiroAutomation:
             )
             cancel.Click()
             time.sleep(0.3)
+        except RuntimeError:
+            pass
+
+        # Cerrar diálogo "Guardar como" colgado (top-level)
+        try:
+            dlg = self._find_control_anywhere(
+                {"name": "Guardar como", "control_type": "WindowControl"},
+                timeout=2,
+            )
+            cerrar = self._find_control_anywhere(
+                {"auto_id": "2", "control_type": "ButtonControl"},
+                timeout=1,
+            )
+            cerrar.Click()
+            time.sleep(0.5)
+            log.info("Diálogo Guardar como colgado cerrado")
         except RuntimeError:
             pass
 
