@@ -200,31 +200,22 @@ class MirSpiroAutomation:
         log.info("Buscando paciente %s…", cedula)
 
         search = self._retry(self._find_search_field, sel)
-
-        # Click sobre el search field usando pyautogui para asegurar foreground + focus
         rect = search.BoundingRectangle
+
         if rect:
-            click_x = (rect.left + rect.right) // 2
-            click_y = (rect.top + rect.bottom) // 2
-            pyautogui.click(click_x, click_y)
+            w = rect.right - rect.left
+            h = rect.bottom - rect.top
+            # Click directo en la "x" de limpiar (borde derecho del search field)
+            # "x" ~90.7% ancho, ~41.7% alto
+            x_click = rect.left + int(w * 0.907)
+            y_click = rect.top + int(h * 0.417)
+            pyautogui.click(x_click, y_click)
+            log.debug("Click en 'x' de limpieza en (%d, %d)", x_click, y_click)
         else:
             search.Click()
 
         time.sleep(0.15)
 
-        # ── Limpiar campo ──────────────────────────────────
-        # Estrategia A: triple click (selecciona todo el texto)
-        if rect:
-            pyautogui.tripleClick(click_x, click_y)
-            time.sleep(0.1)
-            pyautogui.press("delete")
-        else:
-            # Estrategia B: Ctrl+A vía pyautogui
-            pyautogui.hotkey("ctrl", "a")
-            pyautogui.press("delete")
-        time.sleep(0.1)
-
-        # ── Escribir nueva cédula ─────────────────────────
         for ch in cedula:
             search.SendKeys(ch, waitTime=self.typing_delay)
 
@@ -296,6 +287,11 @@ class MirSpiroAutomation:
         """Escribe la ruta completa en el diálogo Guardar como usando pyautogui."""
         import pyautogui
 
+        # Eliminar PDF existente para evitar diálogo de sobrescritura
+        if pdf_path.exists():
+            pdf_path.unlink()
+            log.debug("PDF existente eliminado: %s", pdf_path)
+
         log.info("Esperando diálogo Guardar como…")
         time.sleep(1)
 
@@ -305,17 +301,7 @@ class MirSpiroAutomation:
         pyautogui.typewrite(str(pdf_path.resolve()), interval=0.02)
         time.sleep(0.3)
         pyautogui.press("enter")
-        time.sleep(1)
-
-        # Confirmar sobrescritura si aparece
-        try:
-            confirm = uia.WindowControl(
-                searchDepth=1, Name=sel["overwrite_confirm_title_re"]
-            )
-            if confirm.Exists(maxSearchSeconds=2):
-                pyautogui.press("enter")
-        except Exception:
-            pass
+        time.sleep(2)
 
     def _cerrar_modal_impresion(self) -> None:
         """Cierra el modal de impresión (botón Cancelar) con pyautogui."""
@@ -340,11 +326,26 @@ class MirSpiroAutomation:
 
     # ── Flujo completo ────────────────────────────────────
 
+    def _paciente_encontrado(self) -> bool:
+        """Verifica si la búsqueda encontró un paciente (printButton habilitado)."""
+        try:
+            btn = self._find_control(
+                self.main_window,
+                {"auto_id": self.selectors["print_button_auto_id"]},
+                timeout=3,
+            )
+            return bool(btn.IsEnabled)
+        except Exception:
+            return False
+
     def procesar_paciente(self, cedula: str) -> dict:
         """Busca paciente, exporta PDF y cierra modal. Requiere conectar() antes."""
         result: dict = {"success": False, "pdf_path": None, "error": None}
         try:
             self.buscar_paciente(cedula)
+            time.sleep(0.5)
+            if not self._paciente_encontrado():
+                raise RuntimeError("Paciente no encontrado en MirSpiro")
             pdf_path = self.exportar_pdf(cedula)
             result["success"] = True
             result["pdf_path"] = pdf_path
