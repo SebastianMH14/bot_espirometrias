@@ -1,28 +1,43 @@
 import logging
+import os
 import sys
+from datetime import datetime
 
 import config
 
 
+_log_setup = False
+
+
 def setup_logger():
+    global _log_setup
     logger = logging.getLogger("bot_espirometrias")
+
+    if _log_setup:
+        return logger
+
     logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
 
     formatter = logging.Formatter(
-        "%(asctime)s %(levelname)s %(message)s",
+        "%(asctime)s | %(levelname)-8s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    file_handler = logging.FileHandler(config.LOG_FILE, encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(config.LOG_DIR, f"bot_{ts}.txt")
 
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(formatter)
 
-    logger.handlers.clear()
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(formatter)
 
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+    _log_setup = True
+    logger.info("Log iniciado: %s", log_file)
     return logger

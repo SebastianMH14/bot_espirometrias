@@ -1,10 +1,10 @@
 import json
+import logging
 import pandas as pd
 
 import config
-from modules.logger import setup_logger
 
-logger = setup_logger()
+logger = logging.getLogger("bot_espirometrias")
 
 COL_VARIANTS = {
     "cedula": ["cedula", "cédula", "documento", "identificación", "identificacion", "id", "numero documento", "nro documento", "identificacion del paciente"],

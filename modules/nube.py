@@ -5,15 +5,16 @@ from datetime import date, timedelta, datetime
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import logging
+
 import config
-from modules.logger import setup_logger
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-logger = setup_logger()
+logger = logging.getLogger("bot_espirometrias")
 
 DEBUG_DIR = os.path.join(config.BASE_DIR, "debug")
 os.makedirs(DEBUG_DIR, exist_ok=True)
