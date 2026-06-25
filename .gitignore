@@ -31,3 +31,11 @@ rio_negro/
 # OS
 Thumbs.db
 .DS_Store
+.env.example
+diagnostico_modal.py
+explorar_guardar_como.py
+explorar_mirspiro.py
+mouse_pos.py
+explorar_mirspiro.py
+explorar_mirspiro.py
+resultados_mirspiro.json
