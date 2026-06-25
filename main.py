@@ -1,5 +1,6 @@
 import json
 import sys
+import time
 from datetime import date, timedelta
 
 from pathlib import Path
@@ -22,7 +23,7 @@ def modulo_1(logger) -> list[dict]:
             "Faltan variables de entorno. Revisa el archivo .env "
             "(URL_NUBE, USUARIO, PASSWORD, SEDE_LOCAL)"
         )
-        sys.exit(1)
+        return []
 
     try:
         driver = init_browser()
@@ -31,17 +32,17 @@ def modulo_1(logger) -> list[dict]:
         driver.quit()
     except Exception as e:
         logger.error("Error en automatización web: %s", e)
-        sys.exit(1)
+        return []
 
     if not ruta_excel:
         logger.error("No se descargó ningún archivo Excel")
-        sys.exit(1)
+        return []
 
     try:
         pacientes = leer_excel(ruta_excel)
     except Exception as e:
         logger.error("Error al leer el Excel: %s", e)
-        sys.exit(1)
+        return []
 
     pacientes_sede = filtrar_por_sede(pacientes, config.SEDE_LOCAL)
 
@@ -71,7 +72,6 @@ def modulo_2(logger, pacientes: list[dict]) -> dict:
         typing_delay=config.MIRSPIRO_TYPING_DELAY,
     )
 
-    # Conectar UNA vez al inicio
     try:
         auto.conectar()
     except Exception as e:
@@ -79,14 +79,33 @@ def modulo_2(logger, pacientes: list[dict]) -> dict:
         return {"ok": 0, "fallos": len(pacientes), "detalles": []}
 
     resultados = {"ok": 0, "fallos": 0, "detalles": []}
+    resumen_path = Path(config.DATA_DIR) / "resultados_mirspiro.json"
+
+    ERROR_NO_REINTENTABLE = "Paciente no encontrado en MirSpiro"
+    deadline = time.monotonic() + 3600
 
     for i, pac in enumerate(pacientes, 1):
+        if time.monotonic() > deadline:
+            logger.warning("Tiempo máximo de ejecución alcanzado. Abortando Módulo 2.")
+            break
+
         cedula = str(pac.get("cedula", ""))
         nombre = pac.get("nombre", pac.get("NOMBRE_DEL_PACIENTE", ""))
 
         logger.info("[%d/%d] %s - %s", i, len(pacientes), cedula, nombre)
 
         res = auto.procesar_paciente(cedula)
+
+        if not res["success"] and res["error"] != ERROR_NO_REINTENTABLE:
+            logger.warning(
+                "[%d/%d] Error retryable: %s. Reintentando en 3s…",
+                i, len(pacientes), res["error"],
+            )
+            time.sleep(3)
+            auto.limpiar_estado()
+            res = auto.procesar_paciente(cedula)
+            if res["success"]:
+                logger.info("[%d/%d] Reintento exitoso para %s", i, len(pacientes), cedula)
 
         if res["success"]:
             resultados["ok"] += 1
@@ -95,6 +114,9 @@ def modulo_2(logger, pacientes: list[dict]) -> dict:
             resultados["detalles"].append(
                 {"cedula": cedula, "nombre": nombre, "error": res["error"]}
             )
+
+        with open(resumen_path, "w", encoding="utf-8") as f:
+            json.dump(resultados, f, indent=2, ensure_ascii=False)
 
     auto.cerrar_app()
     logger.info(
@@ -116,11 +138,13 @@ def modulo_3(logger, fecha_objetivo: date) -> dict:
         from selenium.webdriver.support.ui import WebDriverWait
         wait = WebDriverWait(driver, 15)
 
+        deadline_s3 = time.monotonic() + 3600
         res = procesar_carga_pdfs(
             driver=driver,
             wait=wait,
             carpeta_pdfs=config.PDF_DIR,
             fecha_objetivo=fecha_objetivo,
+            deadline=deadline_s3,
         )
         driver.quit()
         return res

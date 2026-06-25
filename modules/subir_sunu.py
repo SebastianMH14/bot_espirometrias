@@ -73,8 +73,6 @@ def abrir_paciente(driver: WebDriver, wait: WebDriverWait, cedula: str) -> None:
         TimeoutException: si no se encuentra el paciente.
     """
     driver.get(URL_PACIENTES)
-    time.sleep(3)
-
     inp = wait.until(
         EC.presence_of_element_located(
             (By.CSS_SELECTOR, "input[type='search']"))
@@ -292,12 +290,12 @@ def _esperar_confirmacion_subida(
     """
     Espera señales de que la subida del PDF se completó.
 
-    Estrategias (cualquiera que ocurra primero):
-      A. El spinner .fa-spin se oculta (vuelve a tener class "hidden").
-      B. Aparece un mensaje de éxito en .estadoSubidaAdjuntoFormato
+    Estrategias (en orden de confianza):
+      A. Aparece un mensaje de éxito en .estadoSubidaAdjuntoFormato
          (con texto que no contenga "error").
-      C. El modal se cierra automáticamente o aparece un mensaje de recarga
-         en .adjuntos-formato-proceso.
+      B. El modal se cierra automáticamente (modal de Bootstrap ya no está visible).
+      C. El spinner .fa-spin se oculta (vuelve a tener class "hidden").
+         Solo se acepta si además no hay texto de error visible.
 
     TODO: Confirmar el selector exacto de éxito inspeccionando la respuesta
     real. Opciones alternativas:
@@ -310,17 +308,7 @@ def _esperar_confirmacion_subida(
     deadline = time.monotonic() + timeout
 
     while time.monotonic() < deadline:
-        # A. Spinner oculto
-        try:
-            spinner = driver.find_element(
-                By.CSS_SELECTOR, "button.btnSubirAdjuntoFormato i.fa-spin"
-            )
-            if "hidden" in (spinner.get_attribute("class") or ""):
-                return True
-        except NoSuchElementException:
-            pass
-
-        # B. Mensaje de éxito en .estadoSubidaAdjuntoFormato
+        # A. Mensaje de éxito en .estadoSubidaAdjuntoFormato
         try:
             estado = driver.find_element(
                 By.CSS_SELECTOR, ".estadoSubidaAdjuntoFormato"
@@ -328,6 +316,33 @@ def _esperar_confirmacion_subida(
             texto = (estado.text or "").lower()
             if texto and "error" not in texto:
                 return True
+        except NoSuchElementException:
+            pass
+
+        # B. Modal cerrado automáticamente
+        try:
+            modales = driver.find_elements(
+                By.CSS_SELECTOR, "div.modal.in, div.modal.fade.in, div.modal.show"
+            )
+            if not modales:
+                return True
+        except Exception:
+            pass
+
+        # C. Spinner oculto + sin texto de error visible
+        try:
+            spinner = driver.find_element(
+                By.CSS_SELECTOR, "button.btnSubirAdjuntoFormato i.fa-spin"
+            )
+            if "hidden" in (spinner.get_attribute("class") or ""):
+                try:
+                    estado = driver.find_element(
+                        By.CSS_SELECTOR, ".estadoSubidaAdjuntoFormato"
+                    )
+                    if "error" not in (estado.text or "").lower():
+                        return True
+                except NoSuchElementException:
+                    return True
         except NoSuchElementException:
             pass
 
@@ -364,11 +379,29 @@ def _cerrar_modal_si_abierto(driver: WebDriver) -> None:
 
 # ── 5. Orquestación del lote completo ───────────────────────
 
+def _driver_vivo(driver: WebDriver) -> bool:
+    """Verifica que el driver de Selenium sigue respondiendo."""
+    try:
+        _ = driver.current_url
+        return True
+    except Exception:
+        return False
+
+
+def _heartbeat(driver: WebDriver, logger, label: str = "") -> None:
+    """Refresca la sesión de Selenium para evitar timeout de inactividad."""
+    try:
+        driver.execute_script("void(0);")
+    except Exception:
+        logger.warning("Heartbeat falló (%s): sesión posiblemente muerta", label)
+
+
 def procesar_carga_pdfs(
     driver: WebDriver,
     wait: WebDriverWait,
     carpeta_pdfs: str | Path,
     fecha_objetivo: date,
+    deadline: float | None = None,
 ) -> dict:
     """
     Recorre todos los PDFs en carpeta_pdfs (nombrados como {cedula}.pdf) y
@@ -397,9 +430,21 @@ def procesar_carga_pdfs(
     exitosos: list[str] = []
     pendientes: list[dict] = []
 
-    for pdf_path in pdfs:
+    for idx, pdf_path in enumerate(pdfs, 1):
         cedula = pdf_path.stem  # filename sin extensión
-        logger.info("Procesando carga para cédula %s…", cedula)
+
+        if deadline and time.monotonic() > deadline:
+            logger.warning("Tiempo máximo de ejecución alcanzado. Abortando Módulo 3.")
+            break
+
+        if not _driver_vivo(driver):
+            logger.error("Driver de Selenium no responde. Abortando Módulo 3.")
+            break
+
+        if idx % 5 == 0:
+            _heartbeat(driver, logger, f"lote_{idx}")
+
+        logger.info("[%d/%d] Carga para cédula %s…", idx, len(pdfs), cedula)
 
         try:
             # ── 5a. Abrir perfil ──
@@ -460,6 +505,49 @@ def procesar_carga_pdfs(
             })
             _cerrar_modal_si_abierto(driver)
             _diagnostic(driver, f"error_{cedula}")
+
+    # ── Segunda pasada: reintentar pendientes recuperables ──
+    MOTIVOS_REINTENTABLES = {
+        MotivoPendiente.ERROR_SUBIDA_PDF,
+        MotivoPendiente.TIMEOUT,
+        MotivoPendiente.ERROR_INESPERADO,
+        MotivoPendiente.MODAL_NO_ABRIO,
+    }
+    retryables = [p for p in pendientes if p["motivo"] in MOTIVOS_REINTENTABLES]
+
+    if retryables:
+        logger.info(
+            "Segunda pasada: reintentando %d de %d pendientes…",
+            len(retryables), len(pendientes),
+        )
+        time.sleep(3)
+        for p in retryables:
+            cedula = p["cedula"]
+            pdf_retry = carpeta / f"{cedula}.pdf"
+            if not pdf_retry.is_file():
+                logger.warning("PDF no encontrado para reintento: %s", pdf_retry)
+                continue
+
+            logger.info("[reintento] Carga para cédula %s…", cedula)
+            try:
+                abrir_paciente(driver, wait, cedula)
+                _click_pestania_espirometria(driver, wait)
+                fila, aria_id = buscar_fila_espirometria(driver, wait, fecha_objetivo)
+                if fila is None:
+                    logger.warning("[reintento] Fecha no encontrada para %s", cedula)
+                    continue
+                ok = subir_pdf_adjunto(driver, wait, cedula, str(pdf_retry.resolve()))
+                if ok:
+                    pendientes.remove(p)
+                    exitosos.append(cedula)
+                    logger.info("[reintento] Exitoso para %s", cedula)
+            except TimeoutException as e:
+                logger.warning("[reintento] Timeout en %s: %s", cedula, e)
+                _cerrar_modal_si_abierto(driver)
+            except Exception as e:
+                logger.exception("[reintento] Error en %s: %s", cedula, e)
+                _cerrar_modal_si_abierto(driver)
+                _diagnostic(driver, f"retry_{cedula}")
 
     # ── Log final ──
     logger.info(

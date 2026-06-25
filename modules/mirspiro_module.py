@@ -151,6 +151,7 @@ class MirSpiroAutomation:
                 log.warning("Intento %d/%d falló: %s", attempt, self.retry_attempts + 1, e)
                 if attempt <= self.retry_attempts:
                     time.sleep(attempt * 1.0)
+        self._diagnostic("retry_exhausted")
         raise last_err  # type: ignore[misc]
 
     def _find_control(
@@ -357,9 +358,7 @@ class MirSpiroAutomation:
         except RuntimeError:
             log.debug("ClearButton no encontrado, campo posiblemente vacío")
 
-        for ch in cedula:
-            search.SendKeys(ch, waitTime=self.typing_delay)
-
+        search.SendKeys(cedula, waitTime=self.typing_delay)
         search.SendKeys("{ENTER}")
         time.sleep(0.3)
         log.info("Búsqueda ejecutada para %s", cedula)
@@ -433,12 +432,14 @@ class MirSpiroAutomation:
         Maneja el diálogo "Guardar como" de Windows.
 
         1. Espera a que aparezca el diálogo (WindowControl Name='Guardar como').
-        2. Escribe la ruta completa vía pyautogui (el EditControl del nombre
+        2. Trae el diálogo al frente antes de escribir.
+        3. Escribe la ruta completa vía pyautogui (el EditControl del nombre
            de archivo está muy anidado dentro del diálogo nativo de Windows
            y no es práctico localizarlo por UIA).
-        3. Hace clic en "Guardar" (ButtonControl AutoId='1') vía UIA.
+        4. Hace clic en "Guardar" (ButtonControl AutoId='1') vía UIA.
         """
         import pyautogui
+        import ctypes
 
         # Eliminar PDF existente para evitar diálogo de sobrescritura
         if pdf_path.exists():
@@ -448,12 +449,21 @@ class MirSpiroAutomation:
         log.info("Esperando diálogo Guardar como…")
 
         # Esperar a que el diálogo aparezca (hasta 10s)
-        self._find_control(
+        dlg = self._find_control(
             self.main_window,
             {"name": "Guardar como", "control_type": "WindowControl"},
             timeout=10,
         )
         log.debug("Diálogo Guardar como detectado")
+
+        # Traer el diálogo al frente usando la HWND nativa
+        try:
+            handle = dlg.NativeWindowHandle
+            if handle:
+                ctypes.windll.user32.SetForegroundWindow(handle)
+                time.sleep(0.3)
+        except Exception:
+            pass
 
         time.sleep(0.5)
 
@@ -558,7 +568,8 @@ class MirSpiroAutomation:
 
         Estrategias (cualquiera indica éxito):
         A. El botón printButton está habilitado.
-        B. NO aparece ninguno de los textos de "sin resultados".
+        B. NO aparece ninguno de los textos de "sin resultados"
+           Y el search field está vacío (indicando que se limpió tras búsqueda exitosa).
         """
         sel = self.selectors
 
@@ -575,6 +586,7 @@ class MirSpiroAutomation:
             pass
 
         # Estrategia B: verificar que NO haya textos de "sin resultados"
+        #               y que el campo de búsqueda tenga contenido
         try:
             for no_result_text in sel.get("no_results_texts", []):
                 try:
@@ -583,12 +595,19 @@ class MirSpiroAutomation:
                         {"name": no_result_text},
                         timeout=1,
                     )
-                    # Texto encontrado → no hay resultados
                     return False
                 except RuntimeError:
                     continue
-            # Ningún texto de "sin resultados" encontrado → probablemente OK
-            return True
+
+            # Confirmación adicional: el search field debería tener texto
+            try:
+                search = self._find_search_field(sel)
+                if search.Name or search.GetValuePattern().Value:
+                    return True
+            except Exception:
+                pass
+
+            return False
         except Exception:
             return False
 
@@ -610,6 +629,46 @@ class MirSpiroAutomation:
             self._diagnostic(f"error_{cedula}")
             result["error"] = str(e)
         return result
+
+    def limpiar_estado(self) -> None:
+        """Intenta cerrar modales abiertos para dejar la app en estado base."""
+        import pyautogui
+        time.sleep(0.5)
+
+        presses = 3
+        while presses > 0:
+            pyautogui.press("escape")
+            time.sleep(0.5)
+            presses -= 1
+
+        try:
+            cancel_btn = self._find_control_with_child(
+                self.main_window,
+                {"name": self.selectors["cancel_button_child_name"]},
+                timeout=2,
+            )
+            cancel_btn.Click()
+            time.sleep(0.5)
+        except RuntimeError:
+            pass
+
+        try:
+            msgbox = self._find_control(
+                self.main_window,
+                {"auto_id": self.selectors["message_box_auto_id"]},
+                timeout=1,
+            )
+            cancel = self._find_control(
+                msgbox,
+                {"auto_id": self.selectors["message_box_cancel_auto_id"]},
+                timeout=1,
+            )
+            cancel.Click()
+            time.sleep(0.3)
+        except RuntimeError:
+            pass
+
+        log.info("Estado limpiado después de fallo")
 
     def cerrar_app(self) -> None:
         """Cierra MirSpiro."""

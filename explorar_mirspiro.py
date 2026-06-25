@@ -1,18 +1,17 @@
 """
-Explorador de UI de MirSpiro.
-Lanza la app, espera carga y vuelca el árbol de controles
-para poder ajustar los selectores del módulo.
+Explorador de UI de MirSpiro (uiautomation).
+Lanza la app, espera carga y vuelca el árbol de controles.
 """
 
 import sys
+import subprocess
+import time
 from pathlib import Path
 
-# Agregar raíz del proyecto al path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import config
-from pywinauto import Application
-from pywinauto.timings import wait_until_passes
+import uiautomation as uia
 
 
 def explorer():
@@ -22,36 +21,50 @@ def explorer():
         sys.exit(1)
 
     print(f"Iniciando MirSpiro desde: {exe}")
-    app = Application(backend="uia").start(exe, timeout=60)
+    subprocess.Popen(exe)
 
     print("Esperando ventana principal (hasta 30s)…")
-    # Intentar varios title_re conocidos
-    posibles = ["MIR Spiro", "MIR", "MirSpiro"]
     main_window = None
-    for title in posibles:
-        try:
-            main_window = app.window(title_re=f".*{title}.*")
-            main_window.wait("visible", timeout=5)
+    deadline = time.monotonic() + 30
+
+    while time.monotonic() < deadline:
+        for w in uia.GetRootControl().GetChildren():
+            if w.ControlTypeName == "WindowControl" and "Mir Spiro" in (w.Name or ""):
+                main_window = w
+                break
+        if main_window:
             break
-        except Exception:
-            continue
+        time.sleep(0.5)
 
     if main_window is None:
-        # Tomar la primera ventana top-level visible
-        main_window = app.top_window()
+        print("No se detectó ninguna ventana")
+        sys.exit(1)
 
-    print(f"\nVentana activa: '{main_window.window_text()}'")
-    print(f"Clase: {main_window.class_name()}")
-    print(f"Control type: {main_window.element_info.control_type}")
+    print(f"\nVentana activa: '{main_window.Name}'")
+    print(f"ClassName: {main_window.ClassName}")
+    print(f"ControlType: {main_window.ControlTypeName}")
+    print(f"AutomationId: {main_window.AutomationId}")
     print("=" * 70)
 
-    # Volcado completo del árbol UI
-    main_window.print_control_identifiers(depth=None)
+    # Volcado del árbol
+    def print_tree(ctrl, depth=0, max_depth=5):
+        if depth > max_depth:
+            return
+        indent = "  " * depth
+        name = (ctrl.Name or "")[:50]
+        print(f"{indent}[{ctrl.ControlTypeName}] Name='{name}' Class='{ctrl.ClassName}' AutoId='{ctrl.AutomationId}'")
+        for child in ctrl.GetChildren():
+            print_tree(child, depth + 1, max_depth)
+
+    print_tree(main_window)
 
     print("\n" + "=" * 70)
-    print("Para cerrar la app, presiona Enter…")
+    print("Presiona Enter para cerrar la app…")
     input()
-    app.kill()
+    try:
+        main_window.GetWindowPattern().Close()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
