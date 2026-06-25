@@ -20,8 +20,9 @@ from enum import Enum
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import logging
+
 import config
-from modules.logger import setup_logger
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver
@@ -29,7 +30,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
-logger = setup_logger()
+logger = logging.getLogger("bot_espirometrias")
 
 URL_PACIENTES = config.URL_NUBE.rstrip("/") + "/pacientes"
 
