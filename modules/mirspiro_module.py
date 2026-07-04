@@ -240,6 +240,35 @@ class MirSpiroAutomation:
             time.sleep(0.3)
         raise RuntimeError(f"Control no encontrado en ningún nivel: {condition}")
 
+    def _find_control_with_child_anywhere(
+        self,
+        child_criteria: dict,
+        timeout: float = 5,
+    ) -> uia.Control:
+        """Busca un control con hijo que cumpla child_criteria, en main_window y root."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                return self._find_control_with_child(
+                    self.main_window, child_criteria, timeout=1
+                )
+            except RuntimeError:
+                pass
+            try:
+                root = uia.GetRootControl()
+                for w in root.GetChildren():
+                    if w.ControlTypeName == "WindowControl":
+                        try:
+                            return self._find_control_with_child(
+                                w, child_criteria, timeout=1
+                            )
+                        except RuntimeError:
+                            continue
+            except Exception:
+                pass
+            time.sleep(0.3)
+        raise RuntimeError(f"Control con hijo no encontrado en ningún nivel: {child_criteria}")
+
     @staticmethod
     def _collect_children(parent, max_depth=10, _depth=0, _results=None):
         """Recolecta todos los controles hijos recursivamente."""
@@ -304,34 +333,63 @@ class MirSpiroAutomation:
         time.sleep(wait_time)
 
         # Buscar en main_window y root simultáneamente (el modal puede estar en cualquier nivel)
+        self._cerrar_modal_suscripcion()
+
+    def _cerrar_modal_suscripcion(self) -> None:
+        """Cierra el modal de suscripción (BtnContinue) si está presente."""
+        sel = self.selectors
         try:
             btn = self._find_control_anywhere(
                 {"auto_id": sel["continue_button_auto_id"]},
-                timeout=10,
+                timeout=8,
             )
             log.info("Click en 'Continuar' (BtnContinue)")
             btn.Click()
             time.sleep(1)
-            log.info("Modal de inicio cerrado")
+
+            # Verificar que desapareció — reintentar si sigue abierto
+            try:
+                self._find_control_anywhere(
+                    {"auto_id": sel["continue_button_auto_id"]},
+                    timeout=3,
+                )
+                log.warning("BtnContinue sigue presente, reintentando clic…")
+                btn = self._find_control_anywhere(
+                    {"auto_id": sel["continue_button_auto_id"]},
+                    timeout=2,
+                )
+                btn.Click()
+                time.sleep(1)
+            except RuntimeError:
+                pass
+            log.info("Modal de suscripción cerrado")
             return
         except RuntimeError:
-            log.info("BtnContinue no encontrado por UIA, usando fallback…")
+            log.info("BtnContinue no encontrado por UIA")
 
-        # Último recurso: pyautogui sobre coordenadas relativas
+        # Último recurso: pyautogui sobre coordenadas del modal (top-level window)
         import pyautogui
-
-        rect = self.main_window.BoundingRectangle
-        if rect:
-            win_w = rect.right - rect.left
-            win_h = rect.bottom - rect.top
-            cx = rect.left + int(win_w * 0.645)
-            cy = rect.top + int(win_h * 0.88)
-            log.info("Fallback: click en 'Continuar' en (%d, %d)", cx, cy)
-            pyautogui.click(cx, cy)
-            time.sleep(1)
-            log.info("Modal cerrado (fallback coordenadas)")
-        else:
-            log.warning("No se pudieron obtener bounds, no se cerró el modal")
+        try:
+            root = uia.GetRootControl()
+            for w in root.GetChildren():
+                if w.ControlTypeName == "WindowControl" and not w.Name:
+                    try:
+                        btn = self._find_control(
+                            w, {"auto_id": sel["continue_button_auto_id"]}, timeout=1
+                        )
+                        rect = btn.BoundingRectangle
+                        if rect:
+                            cx = (rect.left + rect.right) // 2
+                            cy = (rect.top + rect.bottom) // 2
+                            pyautogui.click(cx, cy)
+                            time.sleep(1)
+                            log.info("Modal cerrado (fallback coordenadas de BtnContinue)")
+                        return
+                    except RuntimeError:
+                        continue
+        except Exception:
+            pass
+        log.warning("No se pudo cerrar el modal de suscripción")
 
     # ── 2. Búsqueda de paciente ───────────────────────────
 
@@ -415,30 +473,57 @@ class MirSpiroAutomation:
         return str(pdf_path.resolve())
 
     def _click_imprimir(self, sel: dict) -> None:
-        """Click en el botón 'Imprimir' (AutoId='printButton') vía UIA."""
+        """Click en 'Imprimir' (printButton) — Invoke si disponible, fallback a Click."""
+        # Asegurar que ningún modal esté bloqueando la ventana principal
+        self._cerrar_modal_suscripcion()
+
         btn = self._retry(
             self._find_control,
             self.main_window,
             {"auto_id": sel["print_button_auto_id"]},
         )
-        btn.Click()
-        log.info("Click en 'Imprimir' (printButton)")
-        time.sleep(1)
+        # Intentar Invoke pattern primero (más fiable para controles custom)
+        try:
+            import uiautomation as uia
+            pattern = btn.GetPattern(uia.PatternID.Invoke)
+            if pattern:
+                pattern.Invoke()
+                log.info("Invoke en 'Imprimir' (printButton)")
+            else:
+                btn.Click()
+                log.info("Click en 'Imprimir' (printButton)")
+        except Exception:
+            btn.Click()
+            log.info("Click en 'Imprimir' (printButton)")
+        time.sleep(2)
+
+        # Volcado diagnóstico para ver qué abrió el clic
+        self._dump_arbol_actual("post_click_imprimir")
+
+    def _dump_arbol_actual(self, tag: str) -> None:
+        """Guarda volcado UIA del escritorio para diagnóstico."""
+        try:
+            root = uia.GetRootControl()
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            tree = _dump_uia_tree(root, max_depth=6)
+            path = self._debug_dir / f"{ts}_{tag}.txt"
+            path.write_text(tree, encoding="utf-8")
+            log.debug("Volcado UIA guardado: %s", path)
+        except Exception as exc:
+            log.debug("No se pudo guardar volcado UIA: %s", exc)
 
     def _esperar_modal_impresion(self) -> None:
         """Espera a que el modal de impresión esté presente (savePdfBtn visible)."""
         log.info("Esperando modal de impresión…")
-        self._find_control(
-            self.main_window,
+        self._find_control_anywhere(
             {"auto_id": self.selectors["save_pdf_auto_id"]},
-            timeout=8,
+            timeout=15,
         )
         log.debug("Modal de impresión detectado (savePdfBtn visible)")
 
     def _click_guardar_pdf(self) -> None:
         """Click en 'Guardar PDF' (AutoId='savePdfBtn') dentro del modal de impresión vía UIA."""
-        btn = self._find_control(
-            self.main_window,
+        btn = self._find_control_anywhere(
             {"auto_id": self.selectors["save_pdf_auto_id"]},
             timeout=5,
         )
@@ -531,13 +616,12 @@ class MirSpiroAutomation:
         Cierra el modal de impresión haciendo clic en 'Cancelar' vía UIA.
 
         Localiza el DesertImagelessButton cuyo TextBlock hijo tiene
-        Name='Cancelar', dentro del modal. Verifica que el modal
-        desaparezca del árbol tras el clic.
+        Name='Cancelar', en main_window o ventanas top-level.
+        Verifica que el modal desaparezca del árbol tras el clic.
         """
         sel = self.selectors
 
-        cancel_btn = self._find_control_with_child(
-            self.main_window,
+        cancel_btn = self._find_control_with_child_anywhere(
             {"name": sel["cancel_button_child_name"]},
             timeout=5,
         )
@@ -547,8 +631,7 @@ class MirSpiroAutomation:
 
         # Verificar que savePdfBtn ya no esté visible (modal cerrado)
         try:
-            self._find_control(
-                self.main_window,
+            self._find_control_anywhere(
                 {"auto_id": sel["save_pdf_auto_id"]},
                 timeout=3,
             )

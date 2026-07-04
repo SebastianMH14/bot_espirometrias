@@ -208,12 +208,32 @@ def _ir_siguiente_pagina(driver: WebDriver, wait: WebDriverWait) -> bool:
 
 # ── 4. Subida de PDF en modal de adjuntos ──────────────────
 
+def _ya_cargado(driver: WebDriver) -> bool:
+    """Detecta si el modal de adjuntos muestra que el PDF ya fue cargado previamente."""
+    try:
+        body = driver.find_element(By.CSS_SELECTOR, "div.modal-body")
+        texto = (body.text or "").lower()
+        indicios = ["ya cargado", "archivo cargado", "adjunto cargado", "cargado anteriormente"]
+        if any(i in texto for i in indicios):
+            return True
+    except Exception:
+        pass
+    try:
+        driver.find_element(
+            By.CSS_SELECTOR, "a.adjunto-link, a.btnVerArchivo, a.link-adjunto"
+        )
+        return True
+    except NoSuchElementException:
+        pass
+    return False
+
+
 def subir_pdf_adjunto(
     driver: WebDriver,
     wait: WebDriverWait,
     cedula: str,
     pdf_path: str,
-) -> bool:
+) -> str | None:
     """
     Abre el modal de adjuntos desde la fila de espirometría y sube el PDF.
 
@@ -221,7 +241,9 @@ def subir_pdf_adjunto(
         pdf_path: ruta absoluta al archivo PDF {cedula}.pdf.
 
     Returns:
-        True si la subida se completó exitosamente, False en caso de error.
+        "ok" si se subió correctamente,
+        "ya_cargado" si el PDF ya estaba cargado previamente,
+        None en caso de error.
     """
     # Buscar el botón de adjuntos (ya debería estar visible)
     try:
@@ -232,7 +254,7 @@ def subir_pdf_adjunto(
         logger.debug("Modal de adjuntos abierto")
     except NoSuchElementException:
         logger.warning("Botón de adjuntos no encontrado")
-        return False
+        return None
 
     # Esperar que el modal se abra y el input file esté presente
     try:
@@ -242,16 +264,20 @@ def subir_pdf_adjunto(
             )
         )
     except TimeoutException:
+        if _ya_cargado(driver):
+            logger.info("PDF ya cargado previamente para %s", cedula)
+            _cerrar_modal_si_abierto(driver)
+            return "ya_cargado"
         logger.warning("Modal no se abrió o input file no encontrado")
         _diagnostic(driver, "modal_no_abrio")
         _cerrar_modal_si_abierto(driver)
-        return False
+        return None
 
     # Adjuntar el PDF (ruta absoluta)
     if not os.path.isfile(pdf_path):
         logger.warning("PDF no existe: %s", pdf_path)
         _cerrar_modal_si_abierto(driver)
-        return False
+        return None
 
     file_input.send_keys(os.path.abspath(pdf_path))
     logger.debug("PDF adjuntado al input file: %s", pdf_path)
@@ -266,7 +292,7 @@ def subir_pdf_adjunto(
     except NoSuchElementException:
         logger.warning("Botón 'Cargar PDF' no encontrado")
         _cerrar_modal_si_abierto(driver)
-        return False
+        return None
 
     # Esperar confirmación de subida exitosa
     exito = _esperar_confirmacion_subida(driver, wait)
@@ -275,11 +301,11 @@ def subir_pdf_adjunto(
         logger.warning("No se detectó confirmación de subida para %s", cedula)
         _diagnostic(driver, "subida_fail")
         _cerrar_modal_si_abierto(driver)
-        return False
+        return None
 
     logger.info("PDF subido exitosamente para cédula %s", cedula)
     _cerrar_modal_si_abierto(driver)
-    return True
+    return "ok"
 
 
 def _esperar_confirmacion_subida(
@@ -402,32 +428,45 @@ def procesar_carga_pdfs(
     carpeta_pdfs: str | Path,
     fecha_objetivo: date,
     deadline: float | None = None,
+    cedulas: list[str] | None = None,
 ) -> dict:
     """
-    Recorre todos los PDFs en carpeta_pdfs (nombrados como {cedula}.pdf) y
-    para cada uno: abre perfil, va a espirometría, sube el PDF.
+    Sube los PDFs de los pacientes a Sunu.
+
+    Si se proporciona cedulas, solo procesa esos (ignora PDFs de otros días).
+    Si no, escanea toda la carpeta (comportamiento legacy).
 
     Args:
-        carpeta_pdfs: directorio donde están los PDFs generados por Módulo 2.
-        fecha_objetivo: fecha de atención a buscar en la tabla de cada paciente.
+        carpeta_pdfs: directorio donde están los PDFs.
+        fecha_objetivo: fecha de atención a buscar en la tabla.
+        cedulas: lista opcional de cédulas a procesar (solo estas).
 
     Returns:
-        dict con:
-          - exitosos: list[str] — cédulas cargadas correctamente
-          - pendientes: list[dict] — {cedula, motivo} para los que fallaron
+        dict con exitosos, ya_cargados y pendientes.
     """
     carpeta = Path(carpeta_pdfs)
     if not carpeta.is_dir():
         logger.error("La carpeta de PDFs no existe: %s", carpeta)
         return {"exitosos": [], "pendientes": []}
 
-    pdfs = sorted(carpeta.glob("*.pdf"))
+    if cedulas is not None:
+        pdfs = sorted(
+            p for p in carpeta.glob("*.pdf") if p.stem in cedulas
+        )
+        if len(pdfs) < len(cedulas):
+            faltantes = set(cedulas) - {p.stem for p in pdfs}
+            for c in faltantes:
+                logger.warning("PDF no encontrado para cédula %s", c)
+    else:
+        pdfs = sorted(carpeta.glob("*.pdf"))
+
     if not pdfs:
         logger.warning("No hay PDFs pendientes en %s", carpeta)
         return {"exitosos": [], "pendientes": []}
 
     logger.info("=== FASE 3: Carga de %d PDFs a Sunu ===", len(pdfs))
     exitosos: list[str] = []
+    ya_cargados: list[str] = []
     pendientes: list[dict] = []
 
     for idx, pdf_path in enumerate(pdfs, 1):
@@ -479,9 +518,11 @@ def procesar_carga_pdfs(
 
             # ── 5d. Subir PDF ──
             pdf_ruta = str(pdf_path.resolve())
-            ok = subir_pdf_adjunto(driver, wait, cedula, pdf_ruta)
-            if ok:
+            res_upload = subir_pdf_adjunto(driver, wait, cedula, pdf_ruta)
+            if res_upload == "ok":
                 exitosos.append(cedula)
+            elif res_upload == "ya_cargado":
+                ya_cargados.append(cedula)
             else:
                 pendientes.append({
                     "cedula": cedula,
@@ -536,11 +577,15 @@ def procesar_carga_pdfs(
                 if fila is None:
                     logger.warning("[reintento] Fecha no encontrada para %s", cedula)
                     continue
-                ok = subir_pdf_adjunto(driver, wait, cedula, str(pdf_retry.resolve()))
-                if ok:
+                ok_retry = subir_pdf_adjunto(driver, wait, cedula, str(pdf_retry.resolve()))
+                if ok_retry == "ok":
                     pendientes.remove(p)
                     exitosos.append(cedula)
                     logger.info("[reintento] Exitoso para %s", cedula)
+                elif ok_retry == "ya_cargado":
+                    pendientes.remove(p)
+                    ya_cargados.append(cedula)
+                    logger.info("[reintento] Ya cargado para %s", cedula)
             except TimeoutException as e:
                 logger.warning("[reintento] Timeout en %s: %s", cedula, e)
                 _cerrar_modal_si_abierto(driver)
@@ -551,8 +596,9 @@ def procesar_carga_pdfs(
 
     # ── Log final ──
     logger.info(
-        "FASE 3 completada: %d exitosos, %d pendientes",
+        "FASE 3 completada: %d exitosos, %d ya cargados, %d pendientes",
         len(exitosos),
+        len(ya_cargados),
         len(pendientes),
     )
     for p in pendientes:
@@ -563,5 +609,6 @@ def procesar_carga_pdfs(
 
     return {
         "exitosos": exitosos,
+        "ya_cargados": ya_cargados,
         "pendientes": pendientes,
     }

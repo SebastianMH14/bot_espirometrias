@@ -1,7 +1,10 @@
 import json
+import smtplib
 import sys
 import time
 from datetime import date, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 from pathlib import Path
 
@@ -138,6 +141,16 @@ def modulo_3(logger, fecha_objetivo: date) -> dict:
         from selenium.webdriver.support.ui import WebDriverWait
         wait = WebDriverWait(driver, 15)
 
+        # Solo procesar PDFs de la ejecución actual (evita acumulados)
+        cedulas_ok: list[str] = []
+        mirspiro_path = Path(config.DATA_DIR) / "resultados_mirspiro.json"
+        if mirspiro_path.exists():
+            with open(mirspiro_path, encoding="utf-8") as f:
+                data = json.load(f)
+            for d in data.get("detalles", []):
+                if "pdf" in d:
+                    cedulas_ok.append(d["cedula"])
+
         deadline_s3 = time.monotonic() + 3600
         res = procesar_carga_pdfs(
             driver=driver,
@@ -145,6 +158,7 @@ def modulo_3(logger, fecha_objetivo: date) -> dict:
             carpeta_pdfs=config.PDF_DIR,
             fecha_objetivo=fecha_objetivo,
             deadline=deadline_s3,
+            cedulas=cedulas_ok or None,
         )
         driver.quit()
         return res
@@ -153,10 +167,57 @@ def modulo_3(logger, fecha_objetivo: date) -> dict:
         return {"exitosos": [], "pendientes": []}
 
 
+def _enviar_reporte_email(logger, sede, fecha, mirspiro_res, sunu_res):
+    """Envía el resumen final por correo."""
+    if not all([config.EMAIL_REMITENTE, config.EMAIL_PASSWORD, config.EMAIL_DESTINATARIOS]):
+        logger.warning("Configuración de email incompleta, no se envió reporte")
+        return
+
+    asunto = f"Reporte diario Bot Espirometrías - {sede} - {fecha}"
+    body_parts = [
+        f"Sede: {sede}",
+        f"Fecha objetivo: {fecha}",
+        "",
+        "── Módulo MirSpiro ──",
+        f"  OK:     {mirspiro_res.get('ok', 0)}",
+        f"  Fallos: {mirspiro_res.get('fallos', 0)}",
+    ]
+    for d in mirspiro_res.get("detalles", []):
+        body_parts.append(f"  - {d['cedula']}: {d['error']}")
+
+    body_parts.extend([
+        "",
+        "── Módulo Sunu ──",
+        f"  Subidos:      {len(sunu_res.get('exitosos', []))}",
+        f"  Ya cargados:  {len(sunu_res.get('ya_cargados', []))}",
+        f"  Pendientes:   {len(sunu_res.get('pendientes', []))}",
+    ])
+    for p in sunu_res.get("pendientes", []):
+        body_parts.append(f"  - {p['cedula']}: {p['motivo']}")
+
+    body = "\n".join(body_parts)
+
+    msg = MIMEMultipart()
+    msg["From"] = config.EMAIL_REMITENTE
+    msg["To"] = config.EMAIL_DESTINATARIOS
+    msg["Subject"] = asunto
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    try:
+        server = smtplib.SMTP(config.EMAIL_SMTP_HOST, config.EMAIL_SMTP_PORT)
+        server.starttls()
+        server.login(config.EMAIL_REMITENTE, config.EMAIL_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        logger.info("Reporte enviado por correo a %s", config.EMAIL_DESTINATARIOS)
+    except Exception as e:
+        logger.error("Error al enviar reporte por correo: %s", e)
+
+
 def main():
     logger = setup_logger()
 
-    fecha_objetivo = date.today() - timedelta(days=1)
+    fecha_objetivo = date.today()
     logger.info("Fecha objetivo: %s", fecha_objetivo)
 
     pacientes = modulo_1(logger)
@@ -179,7 +240,77 @@ def main():
         }, f, indent=2, ensure_ascii=False)
     logger.info("Resumen final guardado en %s", resumen_final_path)
 
+    _generar_reporte_local(
+        logger, config.SEDE_LOCAL, fecha_objetivo.isoformat(),
+        resultados_mirspiro, resultados_sunu,
+    )
+
+    _enviar_reporte_email(
+        logger, config.SEDE_LOCAL, fecha_objetivo.isoformat(),
+        resultados_mirspiro, resultados_sunu,
+    )
+
     logger.info("=== FIN ===")
+
+
+def _generar_reporte_local(logger, sede, fecha, mirspiro_res, sunu_res):
+    """Guarda reporte en texto en data/ independientemente del email."""
+    lines = [
+        "=" * 48,
+        f"  REPORTE DIARIO - {sede}",
+        f"  Fecha objetivo: {fecha}",
+        "=" * 48,
+        "",
+    ]
+
+    exitosos = sunu_res.get("exitosos", [])
+    ya_cargados = sunu_res.get("ya_cargados", [])
+    pendientes = sunu_res.get("pendientes", [])
+
+    if exitosos:
+        lines.append(f"--- CÉDULAS CARGADAS EXITOSAMENTE ({len(exitosos)}) ---")
+        lines.append("")
+        for i, c in enumerate(exitosos, 1):
+            lines.append(f"  {i:3d}.  {c}")
+        lines.append("")
+        lines.append("-" * 48)
+
+    if ya_cargados:
+        lines.append(f"--- YA CARGADOS PREVIAMENTE ({len(ya_cargados)}) ---")
+        lines.append("")
+        for c in ya_cargados:
+            lines.append(f"  - {c}")
+        lines.append("")
+        lines.append("-" * 48)
+
+    if mirspiro_res.get("detalles"):
+        lines.append("--- FALLOS EN MIRSPIRO ---")
+        lines.append("")
+        for d in mirspiro_res["detalles"]:
+            lines.append(f"  - {d['cedula']}: {d['error']}")
+        lines.append("")
+        lines.append("-" * 48)
+
+    if pendientes:
+        lines.append(f"--- PENDIENTES DE SUBIR A SUNU ({len(pendientes)}) ---")
+        lines.append("")
+        for p in pendientes:
+            lines.append(f"  - {p['cedula']}: {p['motivo']}")
+        lines.append("")
+        lines.append("-" * 48)
+
+    lines.extend([
+        f"  Total pacientes:     {mirspiro_res.get('ok', 0) + mirspiro_res.get('fallos', 0)}",
+        f"  PDFs generados:      {mirspiro_res.get('ok', 0)}",
+        f"  Subidos a Sunu:      {len(exitosos)}",
+        f"  Ya cargados:         {len(ya_cargados)}",
+        f"  Pendientes Sunu:     {len(pendientes)}",
+        "=" * 48,
+    ])
+
+    path = Path(config.DATA_DIR) / f"reporte_{fecha}_{sede.lower().replace(' ', '_').replace(',', '')}.txt"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("Reporte local guardado en %s", path)
 
 
 if __name__ == "__main__":

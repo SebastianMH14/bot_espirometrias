@@ -165,14 +165,62 @@ def _esperar_descarga(download_dir, timeout=120):
     return None
 
 
+def seleccionar_todas_sedes(driver, wait) -> bool:
+    """
+    Abre el modal de sedes, hace clic en 'Ver Todas' y confirma.
+    """
+    try:
+        btn_sede = wait.until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "a.btnCurrentSede"))
+        )
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});", btn_sede)
+        time.sleep(0.5)
+        try:
+            btn_sede.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", btn_sede)
+
+        wait.until(
+            EC.presence_of_element_located((By.ID, "containerSedesCambiar"))
+        )
+        time.sleep(1)
+
+        btn_ver_todas = wait.until(
+            EC.element_to_be_clickable((By.ID, "btnVertodas"))
+        )
+        btn_ver_todas.click()
+        logger.info("✅ Click en 'Ver Todas'")
+        time.sleep(1)
+
+        # Algunas versiones cierran el modal automáticamente al hacer clic
+        # en "Ver Todas". Intentar confirmar solo si el botón sigue presente.
+        try:
+            btn_confirmar = wait.until(
+                EC.element_to_be_clickable((By.ID, "btnConfirmaCambioSede"))
+            )
+            try:
+                btn_confirmar.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", btn_confirmar)
+            logger.info("✅ Confirmado 'Ver Todas'")
+        except Exception:
+            logger.info("⏭ Modal se cerró solo tras 'Ver Todas' (sin confirmación necesaria)")
+        return True
+    except Exception as e:
+        logger.warning("⚠ No se pudo seleccionar 'Ver Todas': %s", e)
+        return False
+
+
 def descargar_reporte(driver):
     logger.info("Abriendo reporte: %s", config.URL_REPORTE)
     driver.get(config.URL_REPORTE)
 
-    WebDriverWait(driver, 15).until(
+    wait = WebDriverWait(driver, 15)
+    wait.until(
         EC.presence_of_element_located((By.XPATH, "//label[contains(text(), 'Servicio(s)')]"))
     )
-    WebDriverWait(driver, 15).until(
+    wait.until(
         lambda d: d.execute_script("""
             var labels = document.querySelectorAll('label');
             for (var i = 0; i < labels.length; i++) {
@@ -185,7 +233,10 @@ def descargar_reporte(driver):
         """)
     )
 
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    # Seleccionar todas las sedes para que el reporte incluya a todos
+    seleccionar_todas_sedes(driver, wait)
+
+    yesterday = (date.today()).isoformat()
 
     # All form setup + submit in one shot
     driver.execute_script(f"""
