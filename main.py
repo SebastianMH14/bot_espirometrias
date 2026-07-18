@@ -11,7 +11,7 @@ from pathlib import Path
 import config
 from modules.excel import leer_excel, filtrar_por_sede, guardar_pacientes
 from modules.logger import setup_logger
-from modules.mirspiro_module import MirSpiroAutomation
+from modules.mirspiro_module import MirSpiroAutomation, es_error_savepdf
 from modules.nube import init_browser, login, descargar_reporte
 from modules.subir_sunu import procesar_carga_pdfs
 
@@ -81,11 +81,17 @@ def modulo_2(logger, pacientes: list[dict]) -> dict:
         logger.error("No se pudo conectar a MirSpiro: %s", e)
         return {"ok": 0, "fallos": len(pacientes), "detalles": []}
 
-    resultados = {"ok": 0, "fallos": 0, "detalles": []}
+    resultados = {"ok": 0, "fallos": 0, "detalles": [], "exitosos": []}
     resumen_path = Path(config.DATA_DIR) / "resultados_mirspiro.json"
 
     ERROR_NO_REINTENTABLE = "Paciente no encontrado en MirSpiro"
     deadline = time.monotonic() + 3600
+
+    # ── Recuperación ante fallo sistémico de MirSpiro ──
+    MAX_CONSECUTIVE_SAVEPDF_FAIL = 2
+    MAX_APP_RESTARTS = 3
+    consecutive_savepdf_failures = 0
+    app_restarts = 0
 
     for i, pac in enumerate(pacientes, 1):
         if time.monotonic() > deadline:
@@ -110,8 +116,49 @@ def modulo_2(logger, pacientes: list[dict]) -> dict:
             if res["success"]:
                 logger.info("[%d/%d] Reintento exitoso para %s", i, len(pacientes), cedula)
 
+        # ── Recuperación: reiniciar MirSpiro si savePdfBtn falla sistemáticamente ──
+        if not res["success"] and es_error_savepdf(res.get("error")):
+            consecutive_savepdf_failures += 1
+            logger.warning(
+                "Fallo savePdfBtn consecutivo #%d para %s",
+                consecutive_savepdf_failures, cedula,
+            )
+
+            if consecutive_savepdf_failures >= MAX_CONSECUTIVE_SAVEPDF_FAIL:
+                if app_restarts < MAX_APP_RESTARTS:
+                    logger.warning(
+                        "Patrón de fallo savePdfBtn (%d seguidos). Reiniciando MirSpiro...",
+                        consecutive_savepdf_failures,
+                    )
+                    ok = auto.reiniciar()
+                    if ok:
+                        app_restarts += 1
+                        consecutive_savepdf_failures = 0
+                        logger.info("Reintentando %s tras reinicio de MirSpiro", cedula)
+                        res = auto.procesar_paciente(cedula)
+                        if res["success"]:
+                            logger.info(
+                                "[%d/%d] Exitoso tras reinicio: %s",
+                                i, len(pacientes), cedula,
+                            )
+                    else:
+                        logger.critical(
+                            "No se pudo reiniciar MirSpiro. Abortando Módulo 2."
+                        )
+                        break
+                else:
+                    logger.critical(
+                        "Máximo de reinicios de MirSpiro alcanzado (%d). Abortando.",
+                        MAX_APP_RESTARTS,
+                    )
+                    break
+        elif res["success"]:
+            consecutive_savepdf_failures = 0
+        # Otros errores (no savePdfBtn) no incrementan el contador
+
         if res["success"]:
             resultados["ok"] += 1
+            resultados["exitosos"].append(cedula)
         else:
             resultados["fallos"] += 1
             resultados["detalles"].append(
@@ -134,22 +181,24 @@ def modulo_3(logger, fecha_objetivo: date) -> dict:
     """Sube los PDFs generados a los perfiles de los pacientes en Sunu."""
     logger.info("=== MÓDULO 3: Carga de PDFs a Sunu ===")
 
+    # Solo procesar PDFs de la ejecución actual (evita acumulados)
+    cedulas_ok: list[str] = []
+    mirspiro_path = Path(config.DATA_DIR) / "resultados_mirspiro.json"
+    if mirspiro_path.exists():
+        with open(mirspiro_path, encoding="utf-8") as f:
+            data = json.load(f)
+        cedulas_ok = data.get("exitosos", [])
+
+    if not cedulas_ok:
+        logger.info("No hay PDFs exitosos de MirSpiro para subir. Omitiendo Módulo 3.")
+        return {"exitosos": [], "ya_cargados": [], "pendientes": []}
+
     try:
         driver = init_browser()
         from modules.nube import login as nube_login
         nube_login(driver)
         from selenium.webdriver.support.ui import WebDriverWait
         wait = WebDriverWait(driver, 15)
-
-        # Solo procesar PDFs de la ejecución actual (evita acumulados)
-        cedulas_ok: list[str] = []
-        mirspiro_path = Path(config.DATA_DIR) / "resultados_mirspiro.json"
-        if mirspiro_path.exists():
-            with open(mirspiro_path, encoding="utf-8") as f:
-                data = json.load(f)
-            for d in data.get("detalles", []):
-                if "pdf" in d:
-                    cedulas_ok.append(d["cedula"])
 
         deadline_s3 = time.monotonic() + 3600
         res = procesar_carga_pdfs(
@@ -158,13 +207,13 @@ def modulo_3(logger, fecha_objetivo: date) -> dict:
             carpeta_pdfs=config.PDF_DIR,
             fecha_objetivo=fecha_objetivo,
             deadline=deadline_s3,
-            cedulas=cedulas_ok or None,
+            cedulas=cedulas_ok,
         )
         driver.quit()
         return res
     except Exception as e:
         logger.error("Error en Módulo 3: %s", e)
-        return {"exitosos": [], "pendientes": []}
+        return {"exitosos": [], "ya_cargados": [], "pendientes": []}
 
 
 def _enviar_reporte_email(logger, sede, fecha, mirspiro_res, sunu_res):

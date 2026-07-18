@@ -74,6 +74,11 @@ def _build_pdf_filename(cedula: str) -> str:
     return f"{cedula}.pdf"
 
 
+def es_error_savepdf(error_str: str | None) -> bool:
+    """True si el error indica que savePdfBtn no apareció (modal de impresión no se abrió)."""
+    return "savePdfBtn" in error_str if error_str else False
+
+
 def _dump_uia_tree(control: uia.Control, max_depth: int = 6) -> str:
     """Retorna un dump texto del árbol UIA a partir de control."""
     lines: list[str] = []
@@ -805,6 +810,39 @@ class MirSpiroAutomation:
             pass
 
         log.info("Estado limpiado después de fallo")
+
+    def _matar_mirspiro(self) -> None:
+        """Mata todos los procesos de MirSpiro vía taskkill."""
+        import subprocess
+        log.info("Matando procesos de MirSpiro…")
+        try:
+            subprocess.run(
+                ["taskkill", "/f", "/im", "MIR Spiro.exe"],
+                capture_output=True, timeout=10,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("taskkill agotó tiempo de espera")
+        except Exception as e:
+            log.warning("Error al matar MirSpiro: %s", e)
+        time.sleep(2)
+
+    def reiniciar(self) -> bool:
+        """
+        Mata MirSpiro, lo relanza desde cero y reconecta.
+        Retorna True si se recuperó exitosamente.
+        """
+        log.info("=== REINICIANDO MirSpiro ===")
+        self._matar_mirspiro()
+        self.main_window = None
+        time.sleep(2)
+        try:
+            self.conectar()
+            log.info("MirSpiro reiniciado exitosamente")
+            return True
+        except Exception as e:
+            log.error("Error al reiniciar MirSpiro: %s", e)
+            self._diagnostic("reinicio_fail")
+            return False
 
     def cerrar_app(self) -> None:
         """Cierra MirSpiro."""

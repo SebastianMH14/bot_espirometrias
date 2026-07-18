@@ -25,7 +25,11 @@ PACIENTES_FILE = os.path.join(DATA_DIR, "pacientes_pendientes.json")
 # ── MirSpiro ──────────────────────────────────────────────
 MIRSPIRO_EXE = os.getenv("MIRSPIRO_EXE", "")
 MIRSPIRO_TYPING_DELAY = float(os.getenv("MIRSPIRO_TYPING_DELAY", "0.05"))
-PDF_DIR = os.path.join(BASE_DIR, SEDE_LOCAL.lower())
+
+# Sanitized slug for filesystem (remove commas, collapse whitespace to underscores)
+# "LAURELES, ANTIOQUIA" → "laureles_antioquia"
+SEDE_DIR_SLUG = "_".join(SEDE_LOCAL.lower().replace(",", " ").split())
+PDF_DIR = os.path.join(BASE_DIR, SEDE_DIR_SLUG)
 
 # ── Email ─────────────────────────────────────────────────
 EMAIL_REMITENTE = os.getenv("EMAIL_REMITENTE", "")
