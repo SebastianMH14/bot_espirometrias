@@ -21,7 +21,7 @@ Automatización de 3 pasos para espirometrías en CEMDE:
 python -m venv venv
 .\venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env   # editar con credenciales reales
+copy .env.example .env   # editar con credenciales reales
 ```
 
 ## Configuración (`.env`)
@@ -67,10 +67,9 @@ El pipeline completo corre en este orden:
 │   ├── mirspiro_module.py # Módulo 2 — RPA escritorio (uiautomation)
 │   ├── subir_sunu.py    # Módulo 3 — subida PDF a Sunu (Selenium)
 │   └── logger.py        # Logger con archivo rotado + consola
-├── explorar_mirspiro.py   # Diagnóstico: vuelca árbol UIA de MirSpiro
-├── explorar_guardar_como.py # Diagnóstico: inspecciona diálogo Guardar como
-├── diagnostico_modal.py    # Diagnóstico: bounds de modal de impresión
-└── mouse_pos.py            # Utilidad: muestra coordenadas del mouse
+├── tests/
+│   └── test_excel.py    # Tests unitarios del parseo/filtrado de Excel
+└── explorar_mirspiro.py   # Diagnóstico: vuelca árbol UIA de MirSpiro
 ```
 
 ## Debugging
@@ -78,3 +77,10 @@ El pipeline completo corre en este orden:
 - Cada fallo en Módulo 2 genera: `<cedula>_error.png` + `<cedula>_uia_dump.txt`
 - Cada fallo en Módulo 3 genera: `<cedula>_error.png` + `<cedula>_page.html`
 - Los scripts en `explorar_*.py` permiten inspeccionar la UI de MirSpiro sin ejecutar el pipeline completo.
+- `debug/` se limpia automáticamente al iniciar `main.py`: se conservan los archivos de los últimos `DEBUG_RETENTION_DAYS` días (default 14, configurable en `.env`).
+
+## Tests
+
+```bash
+python -m unittest discover tests
+```

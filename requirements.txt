@@ -1,7 +1,7 @@
-selenium>=4.0
-pandas>=2.0
-openpyxl>=3.1
-python-calamine>=0.1
-python-dotenv>=1.0
-uiautomation>=2.0
-pyautogui>=0.9
+selenium==4.46.0
+pandas==3.0.5
+openpyxl==3.1.5
+python-calamine==0.8.2
+python-dotenv==1.2.2
+uiautomation==2.0.29
+pyautogui==0.9.54

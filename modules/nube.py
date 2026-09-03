@@ -212,9 +212,14 @@ def seleccionar_todas_sedes(driver, wait) -> bool:
         return False
 
 
-def descargar_reporte(driver):
+def descargar_reporte(driver, fecha_inicio: date | None = None, fecha_fin: date | None = None):
     logger.info("Abriendo reporte: %s", config.URL_REPORTE)
     driver.get(config.URL_REPORTE)
+
+    if fecha_inicio is None:
+        fecha_inicio = date.today()
+    if fecha_fin is None:
+        fecha_fin = date.today()
 
     wait = WebDriverWait(driver, 15)
     wait.until(
@@ -236,7 +241,8 @@ def descargar_reporte(driver):
     # Seleccionar todas las sedes para que el reporte incluya a todos
     seleccionar_todas_sedes(driver, wait)
 
-    yesterday = (date.today()).isoformat()
+    fecha_ini_str = fecha_inicio.isoformat()
+    fecha_fin_str = fecha_fin.isoformat()
 
     # All form setup + submit in one shot
     driver.execute_script(f"""
@@ -261,8 +267,8 @@ def descargar_reporte(driver):
         }}
 
         // Set dates
-        document.getElementById('fecha_inicio').value = '{yesterday}';
-        document.getElementById('fecha_fin').value = '{yesterday}';
+        document.getElementById('fecha_inicio').value = '{fecha_ini_str}';
+        document.getElementById('fecha_fin').value = '{fecha_fin_str}';
 
         // Set filter
         var f = document.querySelector('#filtros');

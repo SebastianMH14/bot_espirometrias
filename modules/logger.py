@@ -31,6 +31,15 @@ def setup_logger():
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(formatter)
 
+    # En Windows, sys.stdout suele quedar en el codepage de la consola
+    # (cp1252/850) en vez de UTF-8, lo que mostraba tildes/ñ como "�" en
+    # logs volcados a stdout (ej. desde el Programador de tareas).
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(formatter)

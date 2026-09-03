@@ -14,10 +14,16 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, DOWNLOAD_PATH)
 DATA_DIR = os.path.join(BASE_DIR, "data")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
+DEBUG_DIR = os.path.join(BASE_DIR, "debug")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
+# Retención de capturas/volcados de debug (contienen datos de pacientes).
+# Se purgan automáticamente al iniciar main.py los archivos más viejos que esto.
+DEBUG_RETENTION_DAYS = int(os.getenv("DEBUG_RETENTION_DAYS", "14"))
 
 LOG_FILE = os.path.join(LOG_DIR, "bot.log")
 PACIENTES_FILE = os.path.join(DATA_DIR, "pacientes_pendientes.json")

@@ -18,11 +18,14 @@ import time
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import json
 import logging
 
 import config
+from modules.circuit_breaker import CircuitBreaker
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver
@@ -52,6 +55,13 @@ def _diagnostic(driver, tag: str) -> None:
         pass
 
 
+def _build_pdf_filename(cedula: str, fecha: date | None = None) -> str:
+    """Construye el nombre del PDF. Sin fecha → solo cédula (backward compat)."""
+    if fecha is None:
+        return f"{cedula}.pdf"
+    return f"{cedula}_{fecha.isoformat()}.pdf"
+
+
 class MotivoPendiente(str, Enum):
     """Causas por las que un paciente queda sin procesar en Fase 3."""
     PACIENTE_NO_ENCONTRADO = "PACIENTE_NO_ENCONTRADO"
@@ -67,29 +77,69 @@ class MotivoPendiente(str, Enum):
 
 def abrir_paciente(driver: WebDriver, wait: WebDriverWait, cedula: str) -> None:
     """
-    Navega a la lista de pacientes, busca por cédula y abre el perfil.
+    Navega a /pacientes, busca por cédula usando el buscador global
+    ("Búsqueda global de pacientes", widget pgs__*) y abre el perfil.
+
+    Nota: Sunu rediseñó /pacientes (≈2026-08-31): el listado ul#lista-pacientes
+    fue reemplazado por una tabla paginada (#pacientes-table) + un buscador
+    global tipo modal (button.pgs__trigger → input.pgs__input → resultados en
+    #patient-global-search-list → enlace "Abrir perfil" a /pacientes/{id}).
+    El perfil del paciente en sí (pestañas, tabla de espirometría) no cambió.
 
     Raises:
         TimeoutException: si no se encuentra el paciente.
     """
     driver.get(URL_PACIENTES)
-    inp = wait.until(
-        EC.presence_of_element_located(
-            (By.CSS_SELECTOR, "input[type='search']"))
-    )
     cedula_num = re.sub(r"[^\d]", "", cedula)
-    inp.clear()
-    inp.send_keys(cedula_num)
 
-    resultado = wait.until(
-        EC.element_to_be_clickable(
-            (By.XPATH,
-             f"//ul[@id='lista-pacientes']//a[contains(@class,'list-group-item') "
-             f"and contains(.,'{cedula_num}')]")
-        )
+    trigger = wait.until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, "button.pgs__trigger"))
     )
-    driver.execute_script("arguments[0].click();", resultado)
-    logger.debug("Paciente abierto: %s", cedula_num)
+    trigger.click()
+
+    pgs_input = wait.until(
+        EC.visibility_of_element_located((By.CSS_SELECTOR, "input.pgs__input"))
+    )
+    pgs_input.send_keys(cedula_num)
+
+    # Esperar un estado terminal real: hay resultados, o el widget confirma
+    # explícitamente que no encontró nada. Cualquier otro texto (contador de
+    # caracteres, "Escribe para buscar", etc.) es transitorio y no es fiable.
+    wait.until(
+        lambda d: d.find_elements(
+            By.CSS_SELECTOR, "#patient-global-search-list button.pgs__row"
+        )
+        or "No encontramos" in d.find_element(
+            By.ID, "patient-global-search-list"
+        ).text
+    )
+
+    resultados = driver.find_elements(
+        By.CSS_SELECTOR, "#patient-global-search-list button.pgs__row"
+    )
+    resultado = None
+    for r in resultados:
+        try:
+            doc_text = r.find_element(By.CSS_SELECTOR, ".pgs__row-document").text
+        except NoSuchElementException:
+            continue
+        if re.sub(r"[^\d]", "", doc_text) == cedula_num:
+            resultado = r
+            break
+
+    if resultado is None:
+        raise TimeoutException(
+            f"Paciente {cedula_num} no encontrado en búsqueda global de Sunu"
+        )
+
+    resultado.click()
+    logger.debug("Resultado de búsqueda global clickeado: %s", cedula_num)
+
+    perfil_link = wait.until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, "a.pgs__open-profile"))
+    )
+    perfil_link.click()
+    logger.debug("Perfil abierto vía búsqueda global: %s", cedula_num)
 
     wait.until(
         EC.presence_of_element_located(
@@ -125,7 +175,8 @@ def buscar_fila_espirometria(
     fecha_objetivo: date,
 ) -> tuple:
     """
-    Busca en #table tbody la fila cuya primera celda coincida con fecha_objetivo.
+    Busca en #tab-espirometria #table tbody la fila cuya primera celda
+    coincida con fecha_objetivo.
 
     Args:
         fecha_objetivo: fecha a buscar (formato DD/MM/AAAA en la tabla).
@@ -138,6 +189,10 @@ def buscar_fila_espirometria(
         La tabla es un DataTable de jQuery con paginación. Si la fecha no está
         en la primera página, avanza a las siguientes páginas hasta encontrarla
         o hasta que no haya más páginas.
+
+        El id "table" se repite en varias pestañas del perfil del paciente
+        (HTML inválido pero real en Sunu) — por eso todos los selectores acá
+        se anclan a #tab-espirometria para no leer la tabla de otra pestaña.
     """
     fecha_str = fecha_objetivo.strftime("%d/%m/%Y")
     logger.debug("Buscando fila con fecha %s…", fecha_str)
@@ -145,7 +200,7 @@ def buscar_fila_espirometria(
     try:
         wait.until(
             EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "#table tbody")
+                (By.CSS_SELECTOR, "#tab-espirometria #table tbody")
             )
         )
     except TimeoutException:
@@ -167,7 +222,7 @@ def buscar_fila_espirometria(
 
 def _buscar_en_pagina_actual(driver: WebDriver, fecha_str: str) -> tuple:
     """Busca la fecha_str en la página actual de la tabla DataTable."""
-    filas = driver.find_elements(By.CSS_SELECTOR, "#table tbody tr")
+    filas = driver.find_elements(By.CSS_SELECTOR, "#tab-espirometria #table tbody tr")
     for fila in filas:
         try:
             celdas = fila.find_elements(By.TAG_NAME, "td")
@@ -194,7 +249,7 @@ def _ir_siguiente_pagina(driver: WebDriver, wait: WebDriverWait) -> bool:
     try:
         next_btn = driver.find_element(
             By.CSS_SELECTOR,
-            "#table_paginate .paginate_button.next:not(.disabled)"
+            "#tab-espirometria #table_paginate .paginate_button.next:not(.disabled)"
         )
         if next_btn.is_enabled():
             driver.execute_script("arguments[0].click();", next_btn)
@@ -209,7 +264,20 @@ def _ir_siguiente_pagina(driver: WebDriver, wait: WebDriverWait) -> bool:
 # ── 4. Subida de PDF en modal de adjuntos ──────────────────
 
 def _ya_cargado(driver: WebDriver) -> bool:
-    """Detecta si el modal de adjuntos muestra que el PDF ya fue cargado previamente."""
+    """Detecta si el modal de adjuntos muestra que el PDF ya fue cargado previamente.
+
+    Cuando ya existe un adjunto, el modal reemplaza el input de subida por
+    div.adjuntos-formato-proceso (tabla de estado + iframe.visorPdfAdjuntoFormato
+    con el PDF cargado, pendiente de lectura/firma).
+    """
+    try:
+        driver.find_element(
+            By.CSS_SELECTOR,
+            "div.adjuntos-formato-proceso, iframe.visorPdfAdjuntoFormato",
+        )
+        return True
+    except NoSuchElementException:
+        pass
     try:
         body = driver.find_element(By.CSS_SELECTOR, "div.modal-body")
         texto = (body.text or "").lower()
@@ -243,7 +311,9 @@ def subir_pdf_adjunto(
     Returns:
         "ok" si se subió correctamente,
         "ya_cargado" si el PDF ya estaba cargado previamente,
-        None en caso de error.
+        "modal_no_abrio" si el modal/input de subida nunca apareció,
+        "boton_adjuntos_no_encontrado" / "boton_cargar_no_encontrado" /
+        "pdf_no_existe" / "sin_confirmacion" para los demás casos de error.
     """
     # Buscar el botón de adjuntos (ya debería estar visible)
     try:
@@ -254,7 +324,7 @@ def subir_pdf_adjunto(
         logger.debug("Modal de adjuntos abierto")
     except NoSuchElementException:
         logger.warning("Botón de adjuntos no encontrado")
-        return None
+        return "boton_adjuntos_no_encontrado"
 
     # Esperar que el modal se abra y el input file esté presente
     try:
@@ -271,13 +341,13 @@ def subir_pdf_adjunto(
         logger.warning("Modal no se abrió o input file no encontrado")
         _diagnostic(driver, "modal_no_abrio")
         _cerrar_modal_si_abierto(driver)
-        return None
+        return "modal_no_abrio"
 
     # Adjuntar el PDF (ruta absoluta)
     if not os.path.isfile(pdf_path):
         logger.warning("PDF no existe: %s", pdf_path)
         _cerrar_modal_si_abierto(driver)
-        return None
+        return "pdf_no_existe"
 
     file_input.send_keys(os.path.abspath(pdf_path))
     logger.debug("PDF adjuntado al input file: %s", pdf_path)
@@ -292,7 +362,7 @@ def subir_pdf_adjunto(
     except NoSuchElementException:
         logger.warning("Botón 'Cargar PDF' no encontrado")
         _cerrar_modal_si_abierto(driver)
-        return None
+        return "boton_cargar_no_encontrado"
 
     # Esperar confirmación de subida exitosa
     exito = _esperar_confirmacion_subida(driver, wait)
@@ -301,7 +371,7 @@ def subir_pdf_adjunto(
         logger.warning("No se detectó confirmación de subida para %s", cedula)
         _diagnostic(driver, "subida_fail")
         _cerrar_modal_si_abierto(driver)
-        return None
+        return "sin_confirmacion"
 
     logger.info("PDF subido exitosamente para cédula %s", cedula)
     _cerrar_modal_si_abierto(driver)
@@ -426,20 +496,32 @@ def procesar_carga_pdfs(
     driver: WebDriver,
     wait: WebDriverWait,
     carpeta_pdfs: str | Path,
-    fecha_objetivo: date,
+    fecha_objetivo: date | None = None,
     deadline: float | None = None,
     cedulas: list[str] | None = None,
+    items: list[dict[str, Any]] | None = None,
 ) -> dict:
     """
     Sube los PDFs de los pacientes a Sunu.
 
-    Si se proporciona cedulas, solo procesa esos (ignora PDFs de otros días).
-    Si no, escanea toda la carpeta (comportamiento legacy).
+    Dos modos de uso:
+
+    **Modo legacy** (items=None):
+      - Si cedulas se proporciona, filtra la carpeta por esos stems.
+      - Si no, procesa todos los PDFs de la carpeta.
+      - Usa fecha_objetivo para todas las filas (fallback: date.today()).
+
+    **Modo items** (items es una lista de dicts):
+      - Cada item tiene {"cedula": str, "fecha": date|None}.
+      - Construye el nombre del PDF como {cedula}_{fecha}.pdf (o solo {cedula}.pdf si fecha es None).
+      - Usa la fecha de cada item para buscar la fila en la tabla.
+      - Si un item tiene fecha=None, usa fecha_objetivo como fallback.
 
     Args:
         carpeta_pdfs: directorio donde están los PDFs.
-        fecha_objetivo: fecha de atención a buscar en la tabla.
-        cedulas: lista opcional de cédulas a procesar (solo estas).
+        fecha_objetivo: fecha de atención (modo legacy, o fallback para items sin fecha).
+        cedulas: lista de cédulas a procesar (solo modo legacy).
+        items: lista de {"cedula": ..., "fecha": ...}.
 
     Returns:
         dict con exitosos, ya_cargados y pendientes.
@@ -449,41 +531,102 @@ def procesar_carga_pdfs(
         logger.error("La carpeta de PDFs no existe: %s", carpeta)
         return {"exitosos": [], "pendientes": []}
 
-    if cedulas is not None:
-        pdfs = sorted(
-            p for p in carpeta.glob("*.pdf") if p.stem in cedulas
-        )
+    # ── Normalizar entrada a pdf_info: list of (pdf_path, cedula, fecha) ──
+    pdf_info: list[tuple[Path, str, date]] = []
+
+    if items is not None:
+        for item in items:
+            c = item["cedula"]
+            f = item.get("fecha") or fecha_objetivo
+            if f is None:
+                logger.warning("Ítem sin fecha para cédula %s — omitiendo", c)
+                continue
+            pdf_name = _build_pdf_filename(c, f)
+            pdf_path = carpeta / pdf_name
+            if pdf_path.is_file():
+                pdf_info.append((pdf_path, c, f))
+            else:
+                # Fallback: intentar solo con cédula (compatibilidad con PDFs viejos)
+                pdf_old = carpeta / f"{c}.pdf"
+                if pdf_old.is_file():
+                    logger.info("Usando PDF legacy para %s: %s", c, pdf_old.name)
+                    pdf_info.append((pdf_old, c, f))
+                else:
+                    logger.warning("PDF no encontrado para cédula %s: %s", c, pdf_name)
+    elif cedulas is not None:
+        _fecha = fecha_objetivo or date.today()
+        pdfs = sorted(p for p in carpeta.glob("*.pdf") if p.stem in cedulas)
         if len(pdfs) < len(cedulas):
             faltantes = set(cedulas) - {p.stem for p in pdfs}
             for c in faltantes:
                 logger.warning("PDF no encontrado para cédula %s", c)
+        pdf_info = [(p, p.stem, _fecha) for p in pdfs]
     else:
+        _fecha = fecha_objetivo or date.today()
         pdfs = sorted(carpeta.glob("*.pdf"))
+        pdf_info = [(p, p.stem, _fecha) for p in pdfs]
 
-    if not pdfs:
+    if not pdf_info:
         logger.warning("No hay PDFs pendientes en %s", carpeta)
         return {"exitosos": [], "pendientes": []}
 
-    logger.info("=== FASE 3: Carga de %d PDFs a Sunu ===", len(pdfs))
+    logger.info("=== FASE 3: Carga de %d PDFs a Sunu ===", len(pdf_info))
     exitosos: list[str] = []
     ya_cargados: list[str] = []
     pendientes: list[dict] = []
 
-    for idx, pdf_path in enumerate(pdfs, 1):
-        cedula = pdf_path.stem  # filename sin extensión
+    breaker = CircuitBreaker(umbral=5)
+    abortado_temprano: str | None = None
+    progreso_path = Path(config.DATA_DIR) / "resultados_sunu_parcial.json"
+    intentos_reinicio_navegador = 0
+    MAX_REINICIOS_NAVEGADOR = 2
 
+    def _guardar_progreso() -> None:
+        try:
+            with open(progreso_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"exitosos": exitosos, "ya_cargados": ya_cargados, "pendientes": pendientes},
+                    f, indent=2, ensure_ascii=False,
+                )
+        except OSError as e:
+            logger.debug("No se pudo guardar progreso parcial: %s", e)
+
+    for idx, (pdf_path, cedula, fecha_item) in enumerate(pdf_info, 1):
         if deadline and time.monotonic() > deadline:
             logger.warning("Tiempo máximo de ejecución alcanzado. Abortando Módulo 3.")
             break
 
         if not _driver_vivo(driver):
-            logger.error("Driver de Selenium no responde. Abortando Módulo 3.")
-            break
+            if intentos_reinicio_navegador >= MAX_REINICIOS_NAVEGADOR:
+                logger.error(
+                    "Driver de Selenium no responde y se agotaron los reinicios "
+                    "(%d). Abortando Módulo 3.", MAX_REINICIOS_NAVEGADOR,
+                )
+                break
+            intentos_reinicio_navegador += 1
+            logger.warning(
+                "Driver de Selenium no responde. Reintentando navegador (%d/%d)…",
+                intentos_reinicio_navegador, MAX_REINICIOS_NAVEGADOR,
+            )
+            try:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                from modules.nube import init_browser, login as nube_login
+                driver = init_browser()
+                nube_login(driver)
+                wait = WebDriverWait(driver, 15)
+                logger.info("Navegador reiniciado correctamente, continuando lote…")
+            except Exception as e:
+                logger.error("No se pudo reiniciar el navegador: %s. Abortando Módulo 3.", e)
+                break
 
         if idx % 5 == 0:
             _heartbeat(driver, logger, f"lote_{idx}")
 
-        logger.info("[%d/%d] Carga para cédula %s…", idx, len(pdfs), cedula)
+        logger.info("[%d/%d] Carga para cédula %s…", idx, len(pdf_info), cedula)
+        causa_fallo: str | None = None
 
         try:
             # ── 5a. Abrir perfil ──
@@ -494,24 +637,28 @@ def procesar_carga_pdfs(
                 pendientes.append({
                     "cedula": cedula,
                     "motivo": MotivoPendiente.PACIENTE_NO_ENCONTRADO,
+                    "fecha": fecha_item.isoformat() if fecha_item else None,
                 })
+                causa_fallo = MotivoPendiente.PACIENTE_NO_ENCONTRADO.value
                 continue
 
             # ── 5b. Click pestaña Espirometría ──
             _click_pestania_espirometria(driver, wait)
 
             # ── 5c. Buscar fila por fecha ──
-            fila, aria_id = buscar_fila_espirometria(driver, wait, fecha_objetivo)
+            fila, aria_id = buscar_fila_espirometria(driver, wait, fecha_item)
             if fila is None:
                 logger.warning(
                     "Fecha %s no encontrada para %s",
-                    fecha_objetivo.strftime("%d/%m/%Y"),
+                    fecha_item.strftime("%d/%m/%Y"),
                     cedula,
                 )
                 pendientes.append({
                     "cedula": cedula,
                     "motivo": MotivoPendiente.FECHA_NO_ENCONTRADA,
+                    "fecha": fecha_item.isoformat() if fecha_item else None,
                 })
+                causa_fallo = MotivoPendiente.FECHA_NO_ENCONTRADA.value
                 continue
 
             logger.debug("Fila encontrada con aria_id=%s", aria_id)
@@ -524,17 +671,26 @@ def procesar_carga_pdfs(
             elif res_upload == "ya_cargado":
                 ya_cargados.append(cedula)
             else:
+                motivo = (
+                    MotivoPendiente.MODAL_NO_ABRIO
+                    if res_upload == "modal_no_abrio"
+                    else MotivoPendiente.ERROR_SUBIDA_PDF
+                )
                 pendientes.append({
                     "cedula": cedula,
-                    "motivo": MotivoPendiente.ERROR_SUBIDA_PDF,
+                    "motivo": motivo,
+                    "fecha": fecha_item.isoformat() if fecha_item else None,
                 })
+                causa_fallo = motivo.value
 
         except TimeoutException as e:
             logger.warning("Timeout procesando %s: %s", cedula, e)
             pendientes.append({
                 "cedula": cedula,
                 "motivo": MotivoPendiente.TIMEOUT,
+                "fecha": fecha_item.isoformat() if fecha_item else None,
             })
+            causa_fallo = MotivoPendiente.TIMEOUT.value
             _cerrar_modal_si_abierto(driver)
             _diagnostic(driver, f"timeout_{cedula}")
 
@@ -543,9 +699,24 @@ def procesar_carga_pdfs(
             pendientes.append({
                 "cedula": cedula,
                 "motivo": MotivoPendiente.ERROR_INESPERADO,
+                "fecha": fecha_item.isoformat() if fecha_item else None,
             })
+            causa_fallo = MotivoPendiente.ERROR_INESPERADO.value
             _cerrar_modal_si_abierto(driver)
             _diagnostic(driver, f"error_{cedula}")
+
+        finally:
+            # finally corre siempre, incluso cuando el bloque try hizo
+            # "continue" arriba (paciente no encontrado / fecha no encontrada)
+            # — si no, esos casos nunca guardarían progreso ni pasarían por
+            # el circuit breaker. El "break" de más abajo también es válido
+            # acá: si el breaker dispara, corta el "continue" pendiente.
+            _guardar_progreso()
+            alerta = breaker.registrar(ok=causa_fallo is None, causa=causa_fallo)
+            if alerta:
+                logger.critical(alerta)
+                abortado_temprano = alerta
+                break
 
     # ── Segunda pasada: reintentar pendientes recuperables ──
     MOTIVOS_REINTENTABLES = {
@@ -554,7 +725,9 @@ def procesar_carga_pdfs(
         MotivoPendiente.ERROR_INESPERADO,
         MotivoPendiente.MODAL_NO_ABRIO,
     }
-    retryables = [p for p in pendientes if p["motivo"] in MOTIVOS_REINTENTABLES]
+    retryables = [] if abortado_temprano else [
+        p for p in pendientes if p["motivo"] in MOTIVOS_REINTENTABLES
+    ]
 
     if retryables:
         logger.info(
@@ -564,16 +737,31 @@ def procesar_carga_pdfs(
         time.sleep(3)
         for p in retryables:
             cedula = p["cedula"]
-            pdf_retry = carpeta / f"{cedula}.pdf"
+
+            fecha_retry = None
+            if "fecha" in p and p["fecha"]:
+                try:
+                    fecha_retry = date.fromisoformat(p["fecha"])
+                except (ValueError, TypeError):
+                    pass
+            if fecha_retry is None:
+                fecha_retry = fecha_objetivo or date.today()
+
+            pdf_retry = carpeta / _build_pdf_filename(cedula, fecha_retry)
             if not pdf_retry.is_file():
-                logger.warning("PDF no encontrado para reintento: %s", pdf_retry)
-                continue
+                pdf_retry_old = carpeta / f"{cedula}.pdf"
+                if pdf_retry_old.is_file():
+                    pdf_retry = pdf_retry_old
+                    logger.info("Usando PDF legacy para reintento: %s", pdf_retry.name)
+                else:
+                    logger.warning("PDF no encontrado para reintento: %s", pdf_retry)
+                    continue
 
             logger.info("[reintento] Carga para cédula %s…", cedula)
             try:
                 abrir_paciente(driver, wait, cedula)
                 _click_pestania_espirometria(driver, wait)
-                fila, aria_id = buscar_fila_espirometria(driver, wait, fecha_objetivo)
+                fila, aria_id = buscar_fila_espirometria(driver, wait, fecha_retry)
                 if fila is None:
                     logger.warning("[reintento] Fecha no encontrada para %s", cedula)
                     continue
@@ -607,8 +795,11 @@ def procesar_carga_pdfs(
             p["cedula"], p["motivo"],
         )
 
-    return {
+    resultado = {
         "exitosos": exitosos,
         "ya_cargados": ya_cargados,
         "pendientes": pendientes,
     }
+    if abortado_temprano:
+        resultado["abortado_temprano"] = abortado_temprano
+    return resultado

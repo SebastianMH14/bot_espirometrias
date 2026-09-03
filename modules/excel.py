@@ -9,30 +9,55 @@ logger = logging.getLogger("bot_espirometrias")
 COL_VARIANTS = {
     "cedula": ["cedula", "cédula", "documento", "identificación", "identificacion", "id", "numero documento", "nro documento", "identificacion del paciente"],
     "sede": ["sede", "centro", "lugar", "ubicacion", "ubicación", "sucursal", "sede cemde"],
+    "fecha": ["fecha", "fecha de atencion", "fecha atención", "fecha de realizacion",
+              "fecha realizacion", "fecha de la cita", "fecha cita", "fecha de atencion",
+              "fecha_atencion", "fecha de realizacion del procedimiento",
+              "fecha atencion", "fecha_atencion_", "fec atencion", "fec. atención",
+              "fecha de atención", "fecha atención", "fec. atencion", "fecha cita",
+              "fechaatencion", "fecharealizacion", "fecha realizacion procedimiento",
+              "fecha de cita"],
 }
 
 
+_TILDES = str.maketrans("áéíóúñ", "aeioun")
+
+
+def _sin_tildes(s: str) -> str:
+    return s.translate(_TILDES)
+
+
 def _normalizar_columnas(df):
-    columnas_normalizadas = {c: c.lower().strip().replace(" ", "") for c in df.columns}
+    columnas_normalizadas = {
+        c: _sin_tildes(c.lower().strip().replace(" ", "")) for c in df.columns
+    }
     col_cedula = None
     col_sede = None
+    col_fecha = None
 
     for col_original, col_lower in columnas_normalizadas.items():
         if col_cedula is None:
             for variant in COL_VARIANTS["cedula"]:
-                v = variant.lower().strip().replace(" ", "").replace("ó", "o")
-                cl = col_lower.replace("ó", "o")
-                if v == cl:
+                v = _sin_tildes(variant.lower().strip().replace(" ", ""))
+                if v == col_lower:
                     col_cedula = col_original
                     break
         if col_sede is None:
             for variant in COL_VARIANTS["sede"]:
-                v = variant.lower().strip().replace(" ", "").replace("ó", "o")
-                cl = col_lower.replace("ó", "o")
-                if v == cl:
+                v = _sin_tildes(variant.lower().strip().replace(" ", ""))
+                if v == col_lower:
                     col_sede = col_original
                     break
-        if col_cedula and col_sede:
+        if col_fecha is None:
+            for variant in COL_VARIANTS["fecha"]:
+                v = _sin_tildes(variant.lower().strip().replace(" ", ""))
+                if v == col_lower:
+                    col_fecha = col_original
+                    break
+        # Nota: antes se cortaba el bucle apenas se encontraban cédula+sede,
+        # lo que dejaba sin revisar la columna de fecha si venía después en
+        # el Excel (causa probable de por qué "fecha" salía None en varios
+        # reportes reales). Ahora se recorren todas las columnas siempre.
+        if col_cedula and col_sede and col_fecha:
             break
 
     if not col_cedula:
@@ -44,8 +69,15 @@ def _normalizar_columnas(df):
             f"No se encontró columna de sede. Columnas disponibles: {list(df.columns)}"
         )
 
-    df = df.rename(columns={col_cedula: "cedula", col_sede: "sede"})
-    logger.debug("Columnas detectadas: cédula -> '%s', sede -> '%s'", col_cedula, col_sede)
+    rename_map = {col_cedula: "cedula", col_sede: "sede"}
+    if col_fecha:
+        rename_map[col_fecha] = "fecha"
+    df = df.rename(columns=rename_map)
+    logger.debug(
+        "Columnas detectadas: cédula -> '%s', sede -> '%s'%s",
+        col_cedula, col_sede,
+        f", fecha -> '{col_fecha}'" if col_fecha else " (sin columna fecha)",
+    )
     return df
 
 
@@ -66,14 +98,23 @@ def leer_excel(ruta_excel):
     df["cedula"] = df["cedula"].astype(str).str.strip()
     df["sede"] = df["sede"].astype(str).str.strip().str.upper()
 
+    if "fecha" in df.columns:
+        df["fecha"] = pd.to_datetime(df["fecha"], dayfirst=True, errors="coerce").dt.date
+    else:
+        df["fecha"] = None
+
     antes = len(df)
     df = df.dropna(subset=["cedula", "sede"])
     df = df[df["cedula"] != ""]
     df = df[df["sede"] != ""]
-    df = df.drop_duplicates(subset=["cedula"])
-    logger.debug("Registros: %d -> %d (limpios)", antes, len(df))
+    subset_dedup = ["cedula", "fecha"] if "fecha" in df.columns and df["fecha"].notna().any() else ["cedula"]
+    df = df.drop_duplicates(subset=subset_dedup)
+    logger.debug("Registros: %d -> %d (limpios, dedup por %s)", antes, len(df), subset_dedup)
 
-    pacientes = df[["cedula", "sede"]].to_dict(orient="records")
+    cols_out = ["cedula", "sede"]
+    if "fecha" in df.columns:
+        cols_out.append("fecha")
+    pacientes = df[cols_out].to_dict(orient="records")
     logger.info("%d pacientes encontrados en el Excel", len(pacientes))
     return pacientes
 

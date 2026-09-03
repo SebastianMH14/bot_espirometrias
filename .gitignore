@@ -7,19 +7,24 @@ build/
 .venv/
 venv/
 
-# Environment
+# Environment (.env.example SÍ se versiona, es la plantilla)
 .env
 
-# Data & outputs
+# Data & outputs (datos de pacientes, no deben versionarse)
 data/
 downloads/
 debug/
 logs/
+@AutomationLog.txt
 
-# PDFs generados por sede
+# Estado local de herramientas (Claude Code, etc.)
+.claude/
+
+# PDFs generados por sede — el slug real es el de SEDE_DIR_SLUG en config.py
+# (SEDE_LOCAL en minúsculas, sin comas, espacios -> "_")
 bello/
 sabaneta/
-laureles/
+laureles_antioquia/
 rio_negro/
 
 # IDE
@@ -31,11 +36,3 @@ rio_negro/
 # OS
 Thumbs.db
 .DS_Store
-.env.example
-diagnostico_modal.py
-explorar_guardar_como.py
-explorar_mirspiro.py
-mouse_pos.py
-explorar_mirspiro.py
-explorar_mirspiro.py
-resultados_mirspiro.json

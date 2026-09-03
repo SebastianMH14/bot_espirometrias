@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -70,8 +70,10 @@ DEFAULT_SELECTORS: dict[str, Any] = {
 }
 
 
-def _build_pdf_filename(cedula: str) -> str:
-    return f"{cedula}.pdf"
+def _build_pdf_filename(cedula: str, fecha: date | None = None) -> str:
+    if fecha is None:
+        return f"{cedula}.pdf"
+    return f"{cedula}_{fecha.isoformat()}.pdf"
 
 
 def es_error_savepdf(error_str: str | None) -> bool:
@@ -456,9 +458,9 @@ class MirSpiroAutomation:
 
     # ── 3. Imprimir → Guardar PDF ─────────────────────────
 
-    def exportar_pdf(self, cedula: str) -> str:
+    def exportar_pdf(self, cedula: str, fecha: date | None = None) -> str:
         sel = self.selectors
-        pdf_name = _build_pdf_filename(cedula)
+        pdf_name = _build_pdf_filename(cedula, fecha)
         pdf_path = self.output_dir / pdf_name
         log.info("Exportando PDF: %s", pdf_path)
 
@@ -738,7 +740,7 @@ class MirSpiroAutomation:
 
     # ── 6. Flujo completo ─────────────────────────────────
 
-    def procesar_paciente(self, cedula: str) -> dict:
+    def procesar_paciente(self, cedula: str, fecha: date | None = None) -> dict:
         """Busca paciente, exporta PDF y cierra modal. Requiere conectar() antes."""
         result: dict = {"success": False, "pdf_path": None, "error": None}
         try:
@@ -746,7 +748,7 @@ class MirSpiroAutomation:
             time.sleep(0.5)
             if not self._paciente_encontrado():
                 raise RuntimeError("Paciente no encontrado en MirSpiro")
-            pdf_path = self.exportar_pdf(cedula)
+            pdf_path = self.exportar_pdf(cedula, fecha)
             result["success"] = True
             result["pdf_path"] = pdf_path
         except Exception as e:
