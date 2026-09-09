@@ -297,8 +297,40 @@ class MirSpiroAutomation:
 
     # ── 1. Conexión / apertura ────────────────────────────
 
+    def pantalla_bloqueada(self) -> bool:
+        """
+        Detecta si la sesión de Windows está bloqueada (pantalla de bloqueo).
+
+        Con la sesión bloqueada, Windows no entrega input sintético
+        (mouse/teclado, ni SendKeys de UIA) a las aplicaciones del
+        escritorio interactivo — toda la automatización de MirSpiro
+        queda inutilizada hasta que alguien desbloquee la sesión.
+
+        Incidente 2026-09-03/04: la sesión quedó bloqueada durante la
+        corrida de las 21:00 y el bot agotó 15-28 min reintentando cada
+        paciente (0% éxito) antes de rendirse, sin ninguna señal clara
+        de la causa real. Este chequeo permite fallar rápido y con un
+        mensaje explícito en vez de agotar el lote completo en vano.
+        """
+        try:
+            for w in uia.GetRootControl().GetChildren():
+                if w.ClassName == "Windows.UI.Core.CoreWindow":
+                    name = (w.Name or "").lower()
+                    if "bloqueo" in name or "lock" in name:
+                        return True
+        except Exception:
+            pass
+        return False
+
     def conectar(self, timeout: float = 30) -> None:
         """Inicia MirSpiro, cierra el modal de suscripción y localiza la ventana principal."""
+        if self.pantalla_bloqueada():
+            raise RuntimeError(
+                "La sesión de Windows está bloqueada (pantalla de bloqueo). "
+                "No es posible automatizar MirSpiro (mouse/teclado) hasta "
+                "que alguien desbloquee la sesión."
+            )
+
         if self.executable_path:
             log.info("Iniciando MirSpiro desde %s", self.executable_path)
             import subprocess
@@ -392,12 +424,18 @@ class MirSpiroAutomation:
                             w, {"auto_id": sel["continue_button_auto_id"]}, timeout=1
                         )
                         rect = btn.BoundingRectangle
-                        if rect:
+                        if rect and rect.width() > 0 and rect.height() > 0:
                             cx = (rect.left + rect.right) // 2
                             cy = (rect.top + rect.bottom) // 2
                             pyautogui.click(cx, cy)
                             time.sleep(1)
                             log.info("Modal cerrado (fallback coordenadas de BtnContinue)")
+                        else:
+                            log.debug(
+                                "BtnContinue encontrado pero sin tamaño visible (rect=%s), "
+                                "ignorando para no hacer clic en (0,0)",
+                                rect,
+                            )
                         return
                     except RuntimeError:
                         continue

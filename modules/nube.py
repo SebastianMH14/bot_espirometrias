@@ -266,9 +266,12 @@ def descargar_reporte(driver, fecha_inicio: date | None = None, fecha_fin: date 
             form.appendChild(inp);
         }}
 
-        // Set dates
-        document.getElementById('fecha_inicio').value = '{fecha_ini_str}';
-        document.getElementById('fecha_fin').value = '{fecha_fin_str}';
+        // Set dates via la API del plugin bootstrap-datepicker (no basta con
+        // asignar .value: el plugin mantiene su propio estado interno de
+        // fecha y lo puede sobreescribir con su valor por defecto si no se
+        // usa su API).
+        $('#fecha_inicio').datepicker('setDate', '{fecha_ini_str}');
+        $('#fecha_fin').datepicker('setDate', '{fecha_fin_str}');
 
         // Set filter
         var f = document.querySelector('#filtros');

@@ -190,6 +190,14 @@ def modulo_2(logger, pacientes: list[dict], fecha_fallback: date | None = None) 
                     logger.critical(alerta)
                     abortado_temprano = alerta
 
+            if auto.pantalla_bloqueada():
+                abortado_temprano = (
+                    "La sesión de Windows está bloqueada (pantalla de bloqueo). "
+                    "Abortando Módulo 2 para no desperdiciar reintentos: "
+                    f"{len(pacientes) - i}/{len(pacientes)} pacientes sin procesar."
+                )
+                logger.critical(abortado_temprano)
+
         with open(resumen_path, "w", encoding="utf-8") as f:
             json.dump(resultados, f, indent=2, ensure_ascii=False)
 
