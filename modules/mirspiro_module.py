@@ -41,6 +41,13 @@ from pathlib import Path
 from typing import Any
 
 import uiautomation as uia
+import pyautogui
+
+# Bot desatendido (corre sin operador vigilando el mouse): el fail-safe de
+# esquina de pantalla de pyautogui solo genera falsos positivos aquí (el
+# cursor puede terminar en una esquina por RDP/pérdida de foco) y, al no
+# poder ser confirmado por nadie, termina abortando todo el lote.
+pyautogui.FAILSAFE = False
 
 log = logging.getLogger("bot_espirometrias.mirspiro")
 
@@ -758,8 +765,18 @@ class MirSpiroAutomation:
         return result
 
     def limpiar_estado(self) -> None:
-        """Intenta cerrar modales abiertos para dejar la app en estado base."""
-        import pyautogui
+        """Intenta cerrar modales abiertos para dejar la app en estado base.
+
+        Es limpieza de "mejor esfuerzo" entre reintentos: nunca debe
+        propagar una excepción, o abortaría el lote completo de pacientes
+        por un fallo aislado al cerrar un modal.
+        """
+        try:
+            self._limpiar_estado_impl()
+        except Exception as e:
+            log.warning("limpiar_estado falló (ignorado): %s", e)
+
+    def _limpiar_estado_impl(self) -> None:
         time.sleep(0.5)
 
         presses = 3
