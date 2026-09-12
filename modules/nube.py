@@ -244,9 +244,40 @@ def descargar_reporte(driver, fecha_inicio: date | None = None, fecha_fin: date 
     fecha_ini_str = fecha_inicio.isoformat()
     fecha_fin_str = fecha_fin.isoformat()
 
+    # Sunu a veces suspende del todo la generación de este reporte desde su
+    # backend (visto el 2026-09-10: banner "Generación suspendida ... Estamos
+    # trabajando para restablecerla" en vez del formulario). En ese caso no
+    # hay nada que hacer de nuestro lado — cortar rápido con un mensaje claro
+    # en vez de un timeout confuso de 15s + "Cannot read properties of null".
+    suspendido = driver.execute_script("""
+        var texto = document.body.innerText || '';
+        return texto.toLowerCase().includes('generación suspendida')
+            || texto.toLowerCase().includes('generacion suspendida');
+    """)
+    if suspendido:
+        logger.error(
+            "Sunu tiene suspendida la generación del reporte de estado de "
+            "atenciones (aviso del propio sitio). No es un error nuestro: "
+            "hay que esperar a que Sunu la restablezca."
+        )
+        _diagnostic(driver, "reporte_suspendido")
+        return None
+
+    # Esperar a que el formulario del reporte exista en el DOM antes de
+    # tocarlo. Sin esto, en algunas cargas más lentas de la página
+    # (ej. tras actualizarse Chrome) "formReporte" todavía es null cuando
+    # se ejecuta el script de abajo, lanzando "Cannot read properties of
+    # null (reading 'querySelector')" y abortando todo el Módulo 1.
+    wait.until(
+        lambda d: d.execute_script(
+            "return document.getElementById('formReporte') !== null;"
+        )
+    )
+
     # All form setup + submit in one shot
-    driver.execute_script(f"""
+    resultado = driver.execute_script(f"""
         var form = document.getElementById('formReporte');
+        if (!form) return 'formReporte no encontrado';
 
         // Clear any existing selected options on servicio_id select
         var sel = form.querySelector('select[name="servicio_id[]"]');
@@ -266,12 +297,24 @@ def descargar_reporte(driver, fecha_inicio: date | None = None, fecha_fin: date 
             form.appendChild(inp);
         }}
 
-        // Set dates via la API del plugin bootstrap-datepicker (no basta con
-        // asignar .value: el plugin mantiene su propio estado interno de
-        // fecha y lo puede sobreescribir con su valor por defecto si no se
-        // usa su API).
-        $('#fecha_inicio').datepicker('setDate', '{fecha_ini_str}');
-        $('#fecha_fin').datepicker('setDate', '{fecha_fin_str}');
+        // Set dates: usar la API del plugin bootstrap-datepicker (no basta
+        // con asignar .value: el plugin mantiene su propio estado interno
+        // de fecha y lo puede sobreescribir con su valor por defecto si no
+        // se usa su API) — pero si el plugin todavía no está inicializado
+        // sobre el campo, caer a .value en vez de lanzar una excepción.
+        function setFecha(id, valor) {{
+            var el = document.getElementById(id);
+            if (!el) return;
+            try {{
+                if ($(el).data('datepicker')) {{
+                    $(el).datepicker('setDate', valor);
+                    return;
+                }}
+            }} catch (e) {{}}
+            el.value = valor;
+        }}
+        setFecha('fecha_inicio', '{fecha_ini_str}');
+        setFecha('fecha_fin', '{fecha_fin_str}');
 
         // Set filter
         var f = document.querySelector('#filtros');
@@ -284,7 +327,11 @@ def descargar_reporte(driver, fecha_inicio: date | None = None, fecha_fin: date 
         // Submit
         var btn = document.querySelector('button.btnSubmitReportes');
         if (btn) btn.click();
+        return 'ok';
     """)
+    if resultado != 'ok':
+        logger.error("Error preparando formulario de reporte: %s", resultado)
+        return None
 
     # Wait for download
     download_dir = Path(config.DOWNLOAD_DIR).resolve()
