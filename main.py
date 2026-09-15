@@ -180,6 +180,20 @@ def modulo_2(logger, pacientes: list[dict], fecha_fallback: date | None = None) 
             })
             breaker.registrar(ok=True)
         else:
+            # Limpieza obligatoria tras un fallo final (no solo antes del
+            # reintento del mismo paciente): si el modal de impresión o el
+            # diálogo "Guardar como" quedó colgado, se roba el foco de
+            # teclado y hace fallar como "no encontrado" a TODOS los
+            # pacientes siguientes de la corrida (incidente 2026-09-14,
+            # donde 28/29 pacientes fallaron en cascada por esto).
+            try:
+                auto.limpiar_estado()
+            except Exception as e:
+                logger.warning(
+                    "[%d/%d] Error al limpiar estado tras fallo final (continuando): %s",
+                    i, len(pacientes), e,
+                )
+
             resultados["fallos"] += 1
             resultados["detalles"].append(
                 {"cedula": cedula, "nombre": nombre, "error": res["error"]}

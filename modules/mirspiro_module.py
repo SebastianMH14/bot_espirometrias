@@ -84,8 +84,17 @@ def _build_pdf_filename(cedula: str, fecha: date | None = None) -> str:
 
 
 def es_error_savepdf(error_str: str | None) -> bool:
-    """True si el error indica que savePdfBtn no apareció (modal de impresión no se abrió)."""
-    return "savePdfBtn" in error_str if error_str else False
+    """
+    True si el error indica que el flujo de impresión/guardado quedó roto
+    (savePdfBtn no apareció, o el diálogo nativo "Guardar como" no apareció
+    tras hacer clic en savePdfBtn). Ambos dejan un modal de impresión
+    colgado que se roba el foco de teclado y hace fallar como "no
+    encontrado" a TODOS los pacientes siguientes (incidente 2026-09-14),
+    así que ambos deben disparar la recuperación fuerte (reiniciar MirSpiro).
+    """
+    if not error_str:
+        return False
+    return "savePdfBtn" in error_str or "Guardar como" in error_str
 
 
 def _dump_uia_tree(control: uia.Control, max_depth: int = 6) -> str:
