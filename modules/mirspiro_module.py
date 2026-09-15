@@ -583,11 +583,30 @@ class MirSpiroAutomation:
         log.debug("Modal de impresión detectado (savePdfBtn visible)")
 
     def _click_guardar_pdf(self) -> None:
-        """Click en 'Guardar PDF' (AutoId='savePdfBtn') dentro del modal de impresión vía UIA."""
+        """Click en 'Guardar PDF' (AutoId='savePdfBtn') dentro del modal de impresión vía UIA.
+
+        El botón existe en el árbol UIA desde que se abre el modal, pero
+        queda deshabilitado (IsEnabled=False) mientras la vista previa del
+        examen todavía está cargando (spinner visible); un clic en ese
+        estado no hace nada y el diálogo "Guardar como" nunca aparece.
+        Hay que esperar a que se habilite, no solo a que exista.
+        """
+        deadline = time.monotonic() + 15
         btn = self._find_control_anywhere(
             {"auto_id": self.selectors["save_pdf_auto_id"]},
             timeout=5,
         )
+        while not btn.IsEnabled and time.monotonic() < deadline:
+            time.sleep(0.3)
+            btn = self._find_control_anywhere(
+                {"auto_id": self.selectors["save_pdf_auto_id"]},
+                timeout=2,
+            )
+        if not btn.IsEnabled:
+            raise RuntimeError(
+                "savePdfBtn siguió deshabilitado tras esperar "
+                "(vista previa del examen no terminó de cargar)"
+            )
         btn.Click()
         log.info("Click en 'Guardar PDF' (savePdfBtn)")
 
