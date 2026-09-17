@@ -320,15 +320,57 @@ class MirSpiroAutomation:
         paciente (0% éxito) antes de rendirse, sin ninguna señal clara
         de la causa real. Este chequeo permite fallar rápido y con un
         mensaje explícito en vez de agotar el lote completo en vano.
+
+        Incidente 2026-09-15: este chequeo devolvió False mientras la
+        pantalla SÍ estaba bloqueada (confirmado por screenshot), dejando
+        que 5 pacientes fallaran antes de que el circuit breaker genérico
+        cortara la corrida. La causa probable: la enumeración de UIA
+        (uia.GetRootControl().GetChildren()) es una llamada COM pesada que
+        puede fallar transitoriamente, y el try/except silencioso lo
+        interpretaba como "no bloqueada". Ahora el chequeo primario usa la
+        API nativa de Windows (proceso en primer plano), más liviana y
+        confiable, con el método anterior como respaldo con reintentos.
         """
         try:
-            for w in uia.GetRootControl().GetChildren():
-                if w.ClassName == "Windows.UI.Core.CoreWindow":
-                    name = (w.Name or "").lower()
-                    if "bloqueo" in name or "lock" in name:
-                        return True
+            import ctypes
+            from ctypes import wintypes
+
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            if hwnd:
+                pid = wintypes.DWORD()
+                ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                hproc = ctypes.windll.kernel32.OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value
+                )
+                if hproc:
+                    try:
+                        buf = ctypes.create_unicode_buffer(260)
+                        size = wintypes.DWORD(260)
+                        ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                            hproc, 0, buf, ctypes.byref(size)
+                        )
+                        if ok:
+                            exe_name = buf.value.lower()
+                            if "lockapp.exe" in exe_name or "logonui.exe" in exe_name:
+                                return True
+                    finally:
+                        ctypes.windll.kernel32.CloseHandle(hproc)
         except Exception:
             pass
+
+        # Respaldo: método anterior por UIA, con reintentos por si la
+        # enumeración falla transitoriamente (COM/threading).
+        for intento in range(3):
+            try:
+                for w in uia.GetRootControl().GetChildren():
+                    if w.ClassName == "Windows.UI.Core.CoreWindow":
+                        name = (w.Name or "").lower()
+                        if "bloqueo" in name or "lock" in name:
+                            return True
+                return False
+            except Exception:
+                time.sleep(0.3)
         return False
 
     def conectar(self, timeout: float = 30) -> None:
