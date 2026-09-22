@@ -52,6 +52,43 @@ pyautogui.FAILSAFE = False
 log = logging.getLogger("bot_espirometrias.mirspiro")
 
 # ──────────────────────────────────────────────
+# Bindings ctypes para detectar la pantalla de bloqueo de Windows.
+#
+# IMPORTANTE: sin declarar argtypes/restype explícitamente, ctypes asume
+# tipos por defecto (c_int) para los HANDLE/HWND que devuelven estas
+# funciones — en Windows de 64 bits un HANDLE/HWND es un puntero de 64
+# bits, así que sin esta declaración el valor puede truncarse en
+# silencio (sin excepción) y todas las llamadas posteriores fallan
+# devolviendo 0/NULL. Esto causó que la detección de pantalla bloqueada
+# fallara en silencio el 2026-09-19 pese a "funcionar" en pruebas.
+try:
+    import ctypes
+    from ctypes import wintypes as _wt
+
+    _user32 = ctypes.windll.user32
+    _kernel32 = ctypes.windll.kernel32
+
+    _user32.GetForegroundWindow.restype = _wt.HWND
+    _user32.GetForegroundWindow.argtypes = []
+
+    _user32.GetWindowThreadProcessId.restype = _wt.DWORD
+    _user32.GetWindowThreadProcessId.argtypes = [_wt.HWND, ctypes.POINTER(_wt.DWORD)]
+
+    _kernel32.OpenProcess.restype = _wt.HANDLE
+    _kernel32.OpenProcess.argtypes = [_wt.DWORD, _wt.BOOL, _wt.DWORD]
+
+    _kernel32.QueryFullProcessImageNameW.restype = _wt.BOOL
+    _kernel32.QueryFullProcessImageNameW.argtypes = [
+        _wt.HANDLE, _wt.DWORD, _wt.LPWSTR, ctypes.POINTER(_wt.DWORD)
+    ]
+
+    _kernel32.CloseHandle.restype = _wt.BOOL
+    _kernel32.CloseHandle.argtypes = [_wt.HANDLE]
+except Exception:
+    _user32 = None
+    _kernel32 = None
+
+# ──────────────────────────────────────────────
 # Selectores UI por defecto (confirmados por volcado UIA real)
 # ──────────────────────────────────────────────
 DEFAULT_SELECTORS: dict[str, Any] = {
@@ -327,35 +364,41 @@ class MirSpiroAutomation:
         cortara la corrida. La causa probable: la enumeración de UIA
         (uia.GetRootControl().GetChildren()) es una llamada COM pesada que
         puede fallar transitoriamente, y el try/except silencioso lo
-        interpretaba como "no bloqueada". Ahora el chequeo primario usa la
-        API nativa de Windows (proceso en primer plano), más liviana y
-        confiable, con el método anterior como respaldo con reintentos.
+        interpretaba como "no bloqueada". Se agregó un chequeo primario
+        vía API nativa de Windows (proceso en primer plano).
+
+        Incidente 2026-09-19: ese chequeo nativo TAMBIÉN falló en
+        silencio (confirmado de nuevo por screenshot) porque las llamadas
+        ctypes no declaraban argtypes/restype — en Windows de 64 bits un
+        HWND/HANDLE es un puntero de 64 bits, y sin esa declaración
+        ctypes asume el default de 32 bits y trunca el valor sin lanzar
+        excepción, así que OpenProcess terminaba recibiendo un handle
+        basura y fallando silenciosamente. Los bindings ahora declaran
+        argtypes/restype explícitamente a nivel de módulo (_user32/_kernel32).
         """
         try:
-            import ctypes
-            from ctypes import wintypes
-
-            hwnd = ctypes.windll.user32.GetForegroundWindow()
-            if hwnd:
-                pid = wintypes.DWORD()
-                ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-                hproc = ctypes.windll.kernel32.OpenProcess(
-                    PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value
-                )
-                if hproc:
-                    try:
-                        buf = ctypes.create_unicode_buffer(260)
-                        size = wintypes.DWORD(260)
-                        ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
-                            hproc, 0, buf, ctypes.byref(size)
-                        )
-                        if ok:
-                            exe_name = buf.value.lower()
-                            if "lockapp.exe" in exe_name or "logonui.exe" in exe_name:
-                                return True
-                    finally:
-                        ctypes.windll.kernel32.CloseHandle(hproc)
+            if _user32 is not None and _kernel32 is not None:
+                hwnd = _user32.GetForegroundWindow()
+                if hwnd:
+                    pid = _wt.DWORD()
+                    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                    hproc = _kernel32.OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value
+                    )
+                    if hproc:
+                        try:
+                            buf = ctypes.create_unicode_buffer(260)
+                            size = _wt.DWORD(260)
+                            ok = _kernel32.QueryFullProcessImageNameW(
+                                hproc, 0, buf, ctypes.byref(size)
+                            )
+                            if ok:
+                                exe_name = buf.value.lower()
+                                if "lockapp.exe" in exe_name or "logonui.exe" in exe_name:
+                                    return True
+                        finally:
+                            _kernel32.CloseHandle(hproc)
         except Exception:
             pass
 
