@@ -83,10 +83,31 @@ def modulo_2(logger, pacientes: list[dict], fecha_fallback: date | None = None) 
         typing_delay=config.MIRSPIRO_TYPING_DELAY,
     )
 
+    # La primera conexión puede fallar por errores COM transitorios de UIA
+    # justo al arrancar la app (ej. EVENT_E_ALL_SUBSCRIBERS_FAILED, visto el
+    # 2026-09-28: "Un evento no pudo invocar a ninguno de los subscriptores").
+    # Sin retry, un solo fallo aquí perdía el lote completo del día.
+    MAX_CONNECT_ATTEMPTS = 3
+    conectado = False
     try:
         auto.conectar()
+        conectado = True
     except Exception as e:
-        logger.error("No se pudo conectar a MirSpiro: %s", e)
+        logger.warning(
+            "Intento 1/%d de conexión a MirSpiro falló: %s", MAX_CONNECT_ATTEMPTS, e
+        )
+
+    intento = 1
+    while not conectado and intento < MAX_CONNECT_ATTEMPTS:
+        intento += 1
+        conectado = auto.reiniciar()
+        if not conectado:
+            logger.warning(
+                "Intento %d/%d de conexión a MirSpiro falló", intento, MAX_CONNECT_ATTEMPTS
+            )
+
+    if not conectado:
+        logger.error("No se pudo conectar a MirSpiro tras %d intentos", MAX_CONNECT_ATTEMPTS)
         return {"ok": 0, "fallos": len(pacientes), "detalles": []}
 
     resultados = {"ok": 0, "fallos": 0, "detalles": [], "exitosos": []}
