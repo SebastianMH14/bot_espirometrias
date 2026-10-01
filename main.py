@@ -126,7 +126,15 @@ def modulo_2(logger, pacientes: list[dict], fecha_fallback: date | None = None) 
     # "paciente no encontrado", esperable por paciente) se repite muchas
     # veces seguidas — señal de que algo estructural se rompió, no de que
     # varios pacientes puntuales fallaron.
-    breaker = CircuitBreaker(umbral=5)
+    #
+    # Umbral bajado de 5 a 3 el 2026-10-01: pantalla_bloqueada() ha fallado
+    # en detectar varias variantes distintas de bloqueo de Windows pese a
+    # mejoras sucesivas (CoreWindow, LockScreenBackstopFrame, truncamiento
+    # de HANDLE de 64 bits) — parece que Windows puede presentar el estado
+    # "input no llega al escritorio" de formas que no se pueden enumerar
+    # todas de antemano. Este breaker es el respaldo final, así que baja
+    # el costo de una detección fallida de ~5 pacientes (~4-5 min) a 3.
+    breaker = CircuitBreaker(umbral=3)
     abortado_temprano: str | None = None
 
     for i, pac in enumerate(pacientes, 1):

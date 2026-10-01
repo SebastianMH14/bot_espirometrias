@@ -404,13 +404,25 @@ class MirSpiroAutomation:
 
         # Respaldo: método anterior por UIA, con reintentos por si la
         # enumeración falla transitoriamente (COM/threading).
+        #
+        # Incidente 2026-09-30: aparece otra variante más, 'LockScreenBackstopFrame'
+        # (una ventana de respaldo/transición, probablemente ligada a
+        # desconexiones de la sesión de AnyDesk visible en la barra de
+        # tareas de esta máquina), distinta de 'Windows.UI.Core.CoreWindow'.
+        # Con ella presente, el input tampoco llega a MirSpiro aunque esta
+        # ventana en particular no sea la que tiene el foco — así que
+        # cualquier clase que contenga "lockscreen" cuenta como bloqueo,
+        # sin exigir además que tenga el foco.
         for intento in range(3):
             try:
                 for w in uia.GetRootControl().GetChildren():
-                    if w.ClassName == "Windows.UI.Core.CoreWindow":
+                    class_name = (w.ClassName or "")
+                    if class_name == "Windows.UI.Core.CoreWindow":
                         name = (w.Name or "").lower()
                         if "bloqueo" in name or "lock" in name:
                             return True
+                    elif "lockscreen" in class_name.lower():
+                        return True
                 return False
             except Exception:
                 time.sleep(0.3)
