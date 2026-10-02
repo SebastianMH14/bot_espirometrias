@@ -329,6 +329,42 @@ class MirSpiroAutomation:
             time.sleep(0.3)
         raise RuntimeError(f"Control con hijo no encontrado en ningún nivel: {child_criteria}")
 
+    def _traer_al_frente(self, control: uia.Control | None = None) -> bool:
+        """
+        Pone en primer plano la ventana top-level que contiene `control`
+        (por defecto la ventana principal).
+
+        Control.Click() hace clic en coordenadas de pantalla: si otra
+        ventana tapa a MirSpiro, el clic cae sobre esa otra ventana y no
+        pasa nada. Además Windows no deja que un proceso lanzado en
+        segundo plano (ej. desde el Programador de tareas) tome el foco
+        por sí solo, así que MirSpiro puede abrir DETRÁS de lo que esté
+        en pantalla. Incidente 2026-09-23: el modal de suscripción quedó
+        tapado por otra ventana, los clics en BtnContinue no llegaron, el
+        log dijo "cerrado" y el modal siguió bloqueando la ventana
+        principal (ni siquiera cerraba la app al final).
+        """
+        ctrl = control or self.main_window
+        if ctrl is None:
+            return False
+        try:
+            top = ctrl.GetTopLevelControl() or ctrl
+            hwnd = top.NativeWindowHandle
+            for intento in range(3):
+                if uia.GetForegroundWindow() == hwnd:
+                    return True
+                if intento == 1:
+                    # SetForegroundWindow falla si nuestro proceso no tiene
+                    # el foco; un toque de ALT levanta ese bloqueo de Windows.
+                    pyautogui.press("alt")
+                top.SetActive(waitTime=0.3)
+            if uia.GetForegroundWindow() == hwnd:
+                return True
+            log.warning("No se pudo traer al frente la ventana '%s'", top.Name)
+        except Exception as e:
+            log.warning("Error al traer MirSpiro al frente: %s", e)
+        return False
+
     @staticmethod
     def _collect_children(parent, max_depth=10, _depth=0, _results=None):
         """Recolecta todos los controles hijos recursivamente."""
@@ -437,7 +473,24 @@ class MirSpiroAutomation:
                 "que alguien desbloquee la sesión."
             )
 
+        title_re = self.selectors["main_window_title"]
+
         if self.executable_path:
+            # Si alguien dejó MirSpiro abierto, lanzar otra instancia encima
+            # deja al bot agarrado a la ventana vieja mientras el modal de
+            # suscripción de la nueva aparece y desaparece: el clic en
+            # BtnContinue revienta con un COMError y se pierde la corrida
+            # entera (incidente 2026-09-29: 31 pacientes sin procesar).
+            # Se cierra la instancia previa para arrancar siempre limpio.
+            if self._mirspiro_en_ejecucion():
+                log.warning(
+                    "MirSpiro ya estaba abierto al iniciar; cerrándolo para arrancar limpio"
+                )
+                self.main_window = self._buscar_ventana_principal(title_re, timeout=3)
+                self.cerrar_app()
+                self.main_window = None
+                time.sleep(2)
+
             log.info("Iniciando MirSpiro desde %s", self.executable_path)
             import subprocess
             subprocess.Popen(self.executable_path)
@@ -445,25 +498,31 @@ class MirSpiroAutomation:
             log.info("Conectando a MirSpiro ya en ejecución…")
 
         # ── Localizar ventana principal primero ──
-        title_re = self.selectors["main_window_title"]
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            for w in uia.GetRootControl().GetChildren():
-                if w.ControlTypeName == "WindowControl" and title_re in (w.Name or ""):
-                    self.main_window = w
-                    break
-            if self.main_window:
-                break
-            time.sleep(0.5)
+        self.main_window = self._buscar_ventana_principal(title_re, timeout)
 
         if not self.main_window:
             raise RuntimeError(f"No se encontró ventana con título '{title_re}'")
         log.info("Ventana principal: '%s'", self.main_window.Name)
+        self._traer_al_frente()
 
         # ── Cerrar Banner de versión gratuita (UIA) ──
         log.info("Cerrando banner de versión gratuita…")
         self._cerrar_startup_modal()
         log.info("Banner procesado, continuando…")
+
+    @staticmethod
+    def _buscar_ventana_principal(title_re: str, timeout: float) -> uia.Control | None:
+        """Espera hasta `timeout` s a que exista la ventana principal de MirSpiro."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                for w in uia.GetRootControl().GetChildren():
+                    if w.ControlTypeName == "WindowControl" and title_re in (w.Name or ""):
+                        return w
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return None
 
     # ── 1a. Cierre del Banner de versión gratuita ────────
 
@@ -496,28 +555,41 @@ class MirSpiroAutomation:
                 timeout=8,
             )
             log.info("Click en 'Continuar' (BtnContinue)")
+            self._traer_al_frente(btn)
             btn.Click()
             time.sleep(1)
 
             # Verificar que desapareció — reintentar si sigue abierto
+            for _ in range(2):
+                try:
+                    btn = self._find_control_anywhere(
+                        {"auto_id": sel["continue_button_auto_id"]},
+                        timeout=3,
+                    )
+                except RuntimeError:
+                    log.info("Modal de suscripción cerrado")
+                    return
+                log.warning("BtnContinue sigue presente, reintentando clic…")
+                self._traer_al_frente(btn)
+                btn.Click()
+                time.sleep(1)
             try:
                 self._find_control_anywhere(
                     {"auto_id": sel["continue_button_auto_id"]},
-                    timeout=3,
-                )
-                log.warning("BtnContinue sigue presente, reintentando clic…")
-                btn = self._find_control_anywhere(
-                    {"auto_id": sel["continue_button_auto_id"]},
                     timeout=2,
                 )
-                btn.Click()
-                time.sleep(1)
             except RuntimeError:
-                pass
-            log.info("Modal de suscripción cerrado")
+                log.info("Modal de suscripción cerrado")
+                return
+            log.error("El modal de suscripción sigue abierto tras 3 clics en BtnContinue")
+            self._diagnostic("modal_suscripcion_no_cierra")
             return
         except RuntimeError:
             log.info("BtnContinue no encontrado por UIA")
+        except Exception as e:
+            # El botón puede desaparecer entre encontrarlo y hacer clic; UIA
+            # lanza entonces un COMError, que no debe tumbar todo el módulo.
+            log.warning("Error de UIA al cerrar el modal de suscripción: %s", e)
 
         # Último recurso: pyautogui sobre coordenadas del modal (top-level window)
         import pyautogui
@@ -562,6 +634,7 @@ class MirSpiroAutomation:
 
         # 1. Traer MirSpiro al frente y enfocar el campo de búsqueda
         import pyautogui
+        self._traer_al_frente()
         try:
             self.main_window.SetFocus()
             time.sleep(0.2)
@@ -1026,10 +1099,60 @@ class MirSpiroAutomation:
             self._diagnostic("reinicio_fail")
             return False
 
-    def cerrar_app(self) -> None:
-        """Cierra MirSpiro."""
+    @staticmethod
+    def _mirspiro_en_ejecucion() -> bool:
+        import subprocess
+        # Se compara en bytes: tasklist responde en el codepage OEM de la
+        # consola ("INFORMACIÓN: no hay tareas…"), que no es UTF-8 y rompía
+        # la decodificación con PYTHONUTF8=1.
         try:
-            if self.main_window:
-                self.main_window.GetWindowPattern().Close()
+            out = subprocess.run(
+                ["tasklist", "/fi", "imagename eq MIR Spiro.exe", "/nh"],
+                capture_output=True, timeout=10,
+            ).stdout
+            return b"MIR Spiro.exe" in (out or b"")
         except Exception:
-            pass
+            return False
+
+    def cerrar_app(self) -> None:
+        """
+        Cierra MirSpiro y verifica que el proceso terminó.
+
+        En la versión gratuita, cerrar la ventana vuelve a mostrar el modal
+        de suscripción y la app no sale hasta pulsar "Continuar". Si
+        MirSpiro queda abierto, la corrida del día siguiente arranca sobre
+        esa instancia vieja con el modal encima, así que como último
+        recurso se fuerza el cierre.
+        """
+        if self.main_window:
+            try:
+                self._traer_al_frente()
+                self.main_window.GetWindowPattern().Close()
+            except Exception:
+                pass
+
+            deadline = time.monotonic() + 40
+            while time.monotonic() < deadline:
+                if not self._mirspiro_en_ejecucion():
+                    log.info("MirSpiro cerrado")
+                    return
+                try:
+                    btn = self._find_control_anywhere(
+                        {"auto_id": self.selectors["continue_button_auto_id"]},
+                        timeout=1,
+                    )
+                    log.info("Modal de suscripción al cerrar: click en 'Continuar'")
+                    self._traer_al_frente(btn)
+                    btn.Click()
+                except Exception:
+                    # Sin modal a la vista y la app sigue viva: el Close
+                    # anterior lo bloqueó un modal que ya se cerró; repetirlo.
+                    try:
+                        self.main_window.GetWindowPattern().Close()
+                    except Exception:
+                        pass
+                time.sleep(1)
+
+        if self._mirspiro_en_ejecucion():
+            log.warning("MirSpiro no se cerró por las buenas; forzando cierre")
+            self._matar_mirspiro()
