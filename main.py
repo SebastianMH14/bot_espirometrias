@@ -324,12 +324,15 @@ def _enviar_reporte_email(logger, sede, fecha, mirspiro_res, sunu_res, alerta: s
         return
 
     prefijo_asunto = "[ALERTA] " if alerta else ""
-    asunto = f"{prefijo_asunto}Reporte diario Bot Espirometrías - {sede} - {fecha}"
+    ubicacion = f"{sede} - Consultorio {config.CONSULTORIO}" if config.CONSULTORIO else sede
+    asunto = f"{prefijo_asunto}Reporte diario Bot Espirometrías - {ubicacion} - {fecha}"
     body_parts = []
     if alerta:
         body_parts.extend([f"*** {alerta} ***", ""])
+    body_parts.append(f"Sede: {sede}")
+    if config.CONSULTORIO:
+        body_parts.append(f"Consultorio: {config.CONSULTORIO}")
     body_parts += [
-        f"Sede: {sede}",
         f"Fecha objetivo: {fecha}",
         "",
         "── Módulo MirSpiro ──",

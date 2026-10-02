@@ -8,6 +8,8 @@ URL_REPORTE = os.getenv("URL_REPORTE", "")
 USUARIO = os.getenv("USUARIO", "")
 PASSWORD = os.getenv("PASSWORD", "")
 SEDE_LOCAL = os.getenv("SEDE_LOCAL", "").upper()
+# Consultorio dentro de la sede (opcional, solo informativo: se muestra en el correo)
+CONSULTORIO = os.getenv("CONSULTORIO", "").strip()
 DOWNLOAD_PATH = os.getenv("DOWNLOAD_PATH", "downloads")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
